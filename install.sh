@@ -61,7 +61,7 @@ NGINX_WAS=0 NGINX_WHY="" # NGINX_WAS: nginx.conf existed before; NGINX_WHY: why 
 OPEN_TCP=""              # TCP ports < 10000 listening at install time: kept out of the RST drop
 OPEN_HIGH=""             # TCP ports >= 10000 listening at install time: kept out of the ephemeral range
 R_PROTO="" R_LIP="" R_LP="" R_HOST="" R_TP="" R_SRC="" R_SNI=""
-NRCPU_N="" NRCPU_FREE_MB="" REBOOT="" REBOOT_NEEDED=0 # nr_cpus: target and estimate (empty: not needed); --reboot value
+NRCPU_N="" NRCPU_FREE_MB="" REBOOT="" REBOOT_WHY="" # nr_cpus target and estimate (empty: not needed); --reboot; limit|unlimit
 SSH_PORT="22" BBR=n HAVE_IPV6=n SERVER_IP4="" SERVER_IP6="" PREV_INSTALLED=0 DOMAIN_WARNED=0
 
 # ---------------------------------------------------------------- output
@@ -2025,13 +2025,20 @@ cpu_count() {
 	printf '%s' "$n"
 }
 
+nrcpu_saved() { grep -o 'nr_cpus=[0-9]*' "$NRCPU_FILE" 2>/dev/null | head -n1 | cut -d= -f2 || true; }
+nrcpu_booted() { grep -Eq "(^| )nr_cpus=$1( |\$)" /proc/cmdline 2>/dev/null; }
+
 # Some hosters announce far more possible CPUs than exist: the kernel keeps per-CPU memory for each.
 # Sets NRCPU_N and NRCPU_FREE_MB when nr_cpus on the boot line would help (empty otherwise).
 cpu_waste() {
 	local possible present kb n
 	NRCPU_N="" NRCPU_FREE_MB=""
-	# our own file already there: nothing to change
-	if [[ -e $NRCPU_FILE ]]; then return 0; fi
+	# our own file already there: nothing to write, but the reboot may still be pending
+	if [[ -e $NRCPU_FILE ]]; then
+		n=$(nrcpu_saved)
+		if [[ -n $n ]] && ! nrcpu_booted "$n"; then REBOOT_WHY=limit; fi
+		return 0
+	fi
 	command -v update-grub >/dev/null 2>&1 || return 0
 	[[ -f /etc/default/grub && -f /boot/grub/grub.cfg ]] || return 0
 	if systemd-detect-virt --container --quiet 2>/dev/null; then return 0; fi
@@ -2169,9 +2176,15 @@ remove_firewall() {
 
 remove_tuning() {
 	rm -f "$SYSCTL_FILE" "$MODLOAD_FILE"
+	local n
 	if [[ -e $NRCPU_FILE ]]; then
+		n=$(nrcpu_saved)
 		rm -f "$NRCPU_FILE"
-		update-grub >/dev/null 2>&1 || true
+		if ! update-grub >/dev/null 2>&1; then
+			warn "update-grub не прошёл: nr_cpus останется в загрузчике до следующего update-grub." \
+				"update-grub failed: nr_cpus stays in the bootloader until the next update-grub."
+		fi
+		if [[ -n $n ]] && nrcpu_booted "$n"; then REBOOT_WHY=unlimit; fi
 	fi
 }
 
@@ -2181,29 +2194,44 @@ apply_nrcpu() {
 	mkdir -p "$(dirname "$NRCPU_FILE")"
 	render_nrcpu "$NRCPU_N" >"$NRCPU_FILE"
 	chmod 644 "$NRCPU_FILE"
-	if update-grub >/dev/null 2>&1; then
-		REBOOT_NEEDED=1
+	# a later grub.d file may overwrite the line: trust only the generated grub.cfg
+	if update-grub >/dev/null 2>&1 && grep -Eq "(^|[[:space:]])nr_cpus=$NRCPU_N([[:space:]]|\$)" /boot/grub/grub.cfg; then
+		REBOOT_WHY=limit
 		return 0
 	fi
 	rm -f "$NRCPU_FILE"
 	update-grub >/dev/null 2>&1 || true
-	warn "update-grub не прошёл, предел ядер не записан." "update-grub failed, the CPU limit was not set."
+	warn "nr_cpus не попал в загрузчик (update-grub не прошёл или другой файл в /etc/default/grub.d его перекрывает) - предел не задан." \
+		"nr_cpus did not reach the bootloader (update-grub failed or another file in /etc/default/grub.d overrides it) - no limit set."
 	NRCPU_N=""
 }
 
 maybe_reboot() {
-	local go=0
-	if ((!REBOOT_NEEDED)); then return 0; fi
+	local go=0 q_ru q_en later_ru later_en
+	case $REBOOT_WHY in
+	limit)
+		q_ru="Перезагрузить сейчас, чтобы освободить память?" q_en="Reboot now to free the memory?"
+		later_ru="Перезагрузите сервер позже: лишние ядра освободятся после неё."
+		later_en="Reboot the server later: the extra CPUs are freed after it."
+		;;
+	unlimit)
+		q_ru="Перезагрузить сейчас, чтобы снять предел ядер?" q_en="Reboot now to lift the CPU limit?"
+		later_ru="Перезагрузите сервер позже: предел ядер снимется после неё."
+		later_en="Reboot the server later: the CPU limit is lifted after it."
+		;;
+	*) return 0 ;;
+	esac
 	if [[ -n $REBOOT ]]; then
 		if [[ $REBOOT == y ]]; then go=1; fi
-	elif ((!YES)) && confirm "Перезагрузить сейчас, чтобы освободить память?" "Reboot now to free the memory?" y; then
+	elif ((!YES)) && confirm "$q_ru" "$q_en" y; then
 		go=1
 	fi
 	if ((go)); then
 		step "Перезагружаю сервер..." "Rebooting..."
-		systemctl --no-block reboot
+		systemctl --no-block reboot 2>/dev/null ||
+			warn "Перезагрузка не запустилась - перезагрузите сервер сами." "The reboot did not start - reboot the server yourself."
 	else
-		dim "Перезагрузите сервер позже: лишние ядра освободятся после неё." "Reboot the server later: the extra CPUs are freed after it."
+		dim "$later_ru" "$later_en"
 	fi
 }
 
@@ -2469,7 +2497,7 @@ apply() {
 # ---------------------------------------------------------------- status / uninstall / menu
 
 status() {
-	local i j proto lip lp host tp src sni n gk
+	local i j proto lip lp host tp src sni n gk up
 	local -A gseen=()
 	require_root
 	load_settings_globals
@@ -2512,11 +2540,18 @@ status() {
 	svc=$(stc "$(systemctl is-active nginx-stream-ports.service 2>&1 || true)")
 	say "Служба портов: $svc, правил открыто: $n" "Ports service: $svc, rules open: $n"
 	if [[ -e $NRCPU_FILE ]]; then
-		n=$(grep -o 'nr_cpus=[0-9]*' "$NRCPU_FILE" | head -n1 || true)
-		if grep -Eq "(^| )$n( |\$)" /proc/cmdline 2>/dev/null; then
-			say "Лишние ядра: $n в загрузчике" "Extra CPUs: $n in the bootloader"
+		n=$(nrcpu_saved)
+		up=$(cut -d' ' -f1 /proc/uptime)
+		if [[ -z $n ]]; then
+			:
+		elif nrcpu_booted "$n"; then
+			say "Лишние ядра: nr_cpus=$n в загрузчике" "Extra CPUs: nr_cpus=$n in the bootloader"
+		elif (($(stat -c %Y "$NRCPU_FILE") < $(date +%s) - ${up%%.*})); then
+			# rebooted since the file was written, yet the kernel did not get it
+			warn "Лишние ядра: nr_cpus=$n записан, но не применился - сервер грузится не через этот GRUB?" \
+				"Extra CPUs: nr_cpus=$n is written but not applied - does the server boot via another loader?"
 		else
-			say "Лишние ядра: $n в загрузчике (ждёт перезагрузки)" "Extra CPUs: $n in the bootloader (waiting for a reboot)"
+			say "Лишние ядра: nr_cpus=$n в загрузчике (ждёт перезагрузки)" "Extra CPUs: nr_cpus=$n in the bootloader (waiting for a reboot)"
 		fi
 	fi
 	hdr "Настройки ($SETTINGS_FILE):" "Settings ($SETTINGS_FILE):"

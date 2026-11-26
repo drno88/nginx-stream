@@ -194,7 +194,9 @@ Briefly, why it is done this way.
   each (`Percpu:` in `/proc/meminfo`; over 100 MB on a 1 GB server). It fires when the possible CPUs are at least
   four times the real ones and at least 16 MB would be freed; N is the real count but not less than 2. The file is
   written after the install is verified (the rollback does not restore the bootloader), applied with `update-grub`
-  and effective after a reboot. Skipped in a container, without GRUB and when `nr_cpus`/`possible_cpus` is already
+  and effective after a reboot. If the final `/boot/grub/grub.cfg` lacks it (another file in `/etc/default/grub.d`
+  overrides it), the file is removed and no reboot follows; if the server rebooted and the parameter still did not
+  apply, `--status` warns. Skipped in a container, without GRUB and when `nr_cpus`/`possible_cpus` is already
   set. The cap gets in the way of moving to a plan with more CPUs — see "Common problems" in the README.
 - BBR is enabled only if the `tcp_bbr` module loads and `bbr` is among the available algorithms.
 - The output is in color only when it goes to a terminal; `NO_COLOR` (any non-empty value) and `TERM=dumb` turn
