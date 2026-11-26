@@ -5,22 +5,49 @@
 Частый случай: сервер [AntiZapret-VPN](https://github.com/GubernievS/AntiZapret-VPN) закрыт для клиентов по IPv4,
 а по IPv6 доступен. Прокладка принимает клиентов по IPv4 и ведёт их к серверу по IPv6. Нужны три шага.
 
-## 1. На сервере AntiZapret: OpenVPN по IPv6
+## 1. На сервере AntiZapret: `custom-up.sh`
 
-AntiZapret настраивает OpenVPN только на IPv4 (`proto udp4`, `proto tcp4`), и соединения от прокладки по IPv6
-он не примет. Поменяйте строку `proto` и перезапустите работающие серверы OpenVPN:
+Две вещи мешают прокладке работать с AntiZapret по IPv6:
+
+- **OpenVPN слушает только IPv4** (`proto udp4`, `proto tcp4`) и соединения прокладки по IPv6 не примет.
+  `udp6` и `tcp6` принимают и IPv6, и IPv4, так что клиенты, которые ходят напрямую, продолжат работать.
+  WireGuard и AmneziaWG принимают IPv6 и так.
+- **Защита от атак** (если включена) видит всех клиентов прокладки как один адрес. Её лимит — 100 000 новых
+  соединений в час с адреса. Файла исключений для IPv6 у AntiZapret нет: адрес прокладки добавляется в набор
+  `antizapret-allow6` командой, и после перезагрузки он пропадает.
+
+Обе правки кладём в `/root/antizapret/custom-up.sh`: AntiZapret запускает его при каждом старте (и при загрузке
+сервера), а при переустановке сохраняет. Переустановка возвращает `udp4` в конфигах OpenVPN — `custom-up.sh`
+при следующем старте поправит их снова.
+
+Допишите в конец `/root/antizapret/custom-up.sh` (вместо `2001:db8::5` — IPv6-адрес прокладки,
+`ip -6 addr show scope global` на ней):
 
 ```bash
-cd /etc/openvpn/server
-sed -i 's/^proto udp4$/proto udp6/' antizapret-udp.conf vpn-udp.conf
-sed -i 's/^proto tcp4$/proto tcp6/' antizapret-tcp.conf vpn-tcp.conf
-systemctl try-restart openvpn-server@antizapret-udp openvpn-server@vpn-udp \
-  openvpn-server@antizapret-tcp openvpn-server@vpn-tcp
+# nginx-stream: OpenVPN принимает и IPv6 (переустановка AntiZapret возвращает udp4/tcp4)
+cd /etc/openvpn/server &&
+	if grep -qsE '^proto (udp|tcp)4$' antizapret-udp.conf vpn-udp.conf antizapret-tcp.conf vpn-tcp.conf; then
+		sed -i -E 's/^proto (udp|tcp)4$/proto \16/' antizapret-udp.conf vpn-udp.conf antizapret-tcp.conf vpn-tcp.conf
+		systemctl --no-block try-restart openvpn-server@antizapret-udp openvpn-server@vpn-udp \
+			openvpn-server@antizapret-tcp openvpn-server@vpn-tcp 2>/dev/null
+	fi
+cd /root/antizapret
+# nginx-stream: адрес прокладки - в исключения защиты от атак
+ipset add antizapret-allow6 2001:db8::5 -exist 2>/dev/null || true
 ```
 
-`udp6` и `tcp6` принимают и IPv6, и IPv4, так что клиенты, которые ходят напрямую, продолжают работать.
-WireGuard и AmneziaWG по IPv6 принимают и без правок. **После переустановки или обновления AntiZapret
-правку повторите** — он вернёт `udp4`. Проверено на UDP; TCP настраивается так же.
+Применить сразу: `systemctl restart antizapret`. Серверы OpenVPN перезапустятся один раз — клиенты
+переподключатся; при следующих стартах, если конфиги уже правильные, OpenVPN не трогается.
+
+Проверить:
+
+```bash
+grep -H '^proto' /etc/openvpn/server/*.conf    # udp6 / tcp6
+ss -Hlnup | grep openvpn                       # [::]:50443, [::]:50080 и т. д.
+ipset list antizapret-allow6 | tail -n 3       # адрес прокладки (только при включённой защите)
+```
+
+Защита выключена — строка с `ipset` ничего не делает. Проверено на UDP; TCP настраивается так же.
 
 ## 2. На прокладке: установка с портами AntiZapret
 
@@ -50,9 +77,3 @@ bash <(wget -qO- --inet4-only https://raw.githubusercontent.com/drno88/nginx-str
 
 В профилях замените адрес сервера AntiZapret на адрес прокладки: строка `remote` в OpenVPN, `Endpoint` в WireGuard
 и AmneziaWG. Порты не меняются.
-
-## Если в AntiZapret включена защита от атак
-
-Все клиенты приходят к нему с одного адреса прокладки. Лимит защиты — 100 000 новых соединений в час с адреса;
-обычно этого хватает. Файла исключений для IPv6 у AntiZapret нет; при большой нагрузке адрес прокладки можно
-исключить командой `ipset add antizapret-allow6 <IPv6 прокладки>` (действует до перезапуска AntiZapret).
