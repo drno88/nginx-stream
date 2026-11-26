@@ -1,9 +1,9 @@
 #!/bin/sh
-# nginx-stream: opens the relay ports in iptables and in foreign nftables input chains (rules marked nginx-stream)
+# nginx-stream: opens relay ports in iptables and foreign nft input chains (rules marked nginx-stream)
 PORTS='udp:443:4 tcp:443:4 tcp:8443:6 tcp:2222:46'
 rc=0
 
-# ports_for FAMILY: proto:port of the tokens that fit the table family (4, 6 or 46), without duplicates
+# ports_for FAMILY (4|6|46): proto:port of the fitting tokens, unique
 ports_for() {
 	for t in $PORTS; do
 		f=${t##*:}
@@ -32,15 +32,13 @@ down() {
 	done
 }
 
-# Where the ACCEPT goes: not first (it would bypass the owner's bans "-s X -j DROP" and block sets), but where the
-# chain would close the port: before its final catch-all DROP/REJECT, or at the end if only the policy is DROP.
-# A chain that accepts by default and has no final catch-all drop has the ports open already: nothing is added.
+# ACCEPT goes before the final catch-all DROP/REJECT, or at the end if only the policy drops; not first:
+# that would bypass the owner's bans (-s X -j DROP, sets). A chain open by default needs nothing.
 
 # ipt_up BIN FAMILY
 ipt_up() {
 	command -v "$1" >/dev/null 2>&1 || return 0
-	# "I N": the last -A INPUT rule is a bare DROP/REJECT (a comment and an input interface allowed) and is rule
-	# number N; "A": policy DROP; "N": nothing to do
+	# "I N": the last rule N is a bare DROP/REJECT (comment, input interface allowed); "A": policy DROP; "N": none
 	where=$("$1" -w 5 -S INPUT 2>/dev/null | awk '
 		/^-P INPUT / { pol = $3 }
 		/^-A INPUT / { n++; last = $0; lastn = n }
@@ -60,9 +58,8 @@ ipt_up() {
 	done
 }
 
-# nft_up: every foreign base chain of the input hook (not iptables-nft's INPUT: iptables owns it). The last rule
-# is a bare drop/reject (counter, log, comment, input interface allowed): insert before it, by its handle. No such rule
-# and policy drop: add to the end. Otherwise the chain lets the ports through already.
+# nft_up: foreign base chains of the input hook (not iptables-nft's INPUT: iptables owns it): insert by handle
+# before the final bare drop/reject (counter, log, comment, iif allowed); with only policy drop, add at the end.
 nft_up() {
 	command -v nft >/dev/null 2>&1 || return 0
 	for c in $(nft -a list ruleset 2>/dev/null | awk '
@@ -116,10 +113,10 @@ nft_up() {
 	done
 }
 
-# ufw has the ports open by its own rules (the installer adds them); our ACCEPT in INPUT would bypass its denies
+# ufw: the installer adds its own rules; our INPUT ACCEPT would bypass its denies
 ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; }
 
-# firewalld: the ports are only printed by the installer; its reload would wipe our rules, so none are added
+# firewalld: ports are only printed; its reload would wipe our rules
 firewalld_active() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld; }
 
 up() {

@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# nginx-stream: relay (transparent TCP/UDP forwarder) on nginx "stream".
-# Installer for Debian 12+ / Ubuntu 22.04+. One self-contained file.
+# nginx-stream: TCP/UDP relay on nginx "stream" for Debian 12+ / Ubuntu 22.04+. One self-contained file.
 # Run:  bash <(wget -qO- --inet4-only https://raw.githubusercontent.com/drno88/nginx-stream/main/install.sh)
 # Help: bash install.sh --help
-#
-# Layout of this file: constants, output helpers, questions, pure render_* functions
-# (stdout only, shared by --dry-run and the real install), system actions, entry point.
-# The last line of the file must stay "main": with `curl | bash` bash reads the script
-# from stdin and we re-open stdin from /dev/tty only after everything has been parsed.
+# The last line must stay "main": under `curl | bash` the whole script is parsed before stdin goes back to /dev/tty.
 set -Eeuo pipefail
 
 if ((BASH_VERSINFO[0] < 4)); then
@@ -43,7 +38,7 @@ readonly SELF_PATH=/usr/local/sbin/nginx-stream
 readonly SELF_URL=https://raw.githubusercontent.com/drno88/nginx-stream/main/install.sh
 readonly NFT_TABLE="inet nginx_stream"
 
-# Everything that is asked, saved to settings.env and used as a default on reconfigure.
+# Questions: saved to settings.env, reused as defaults on reconfigure.
 SETTING_KEYS=(UI_LANG TARGET PORTS
 	LISTEN PROXY_PROTOCOL LOGS TCP_TIMEOUT UDP_TIMEOUT TUNE SSH_PROTECT SCAN_PROTECT AUTO_UPDATES
 	NGINX_MODE NGINX_FRESH DEFAULT_SITE_REMOVED UFW_RULES INSTALLER_VERSION)
@@ -53,28 +48,28 @@ LISTEN="" PROXY_PROTOCOL="" LOGS="" TCP_TIMEOUT="" UDP_TIMEOUT="" TUNE="" SSH_PR
 AUTO_UPDATES="" NGINX_MODE="" NGINX_FRESH="" DEFAULT_SITE_REMOVED="" UFW_RULES="" INSTALLER_VERSION=""
 
 ACTION="" YES=0 DRY_RUN=0 OUT_DIR="./out" RAM_MB=""
-declare -A D=()          # defaults for the questions (static, detected, or previous answers)
-RULES=()                 # "proto listen_ip listen host target_port src sni" (listen_ip: * = all; src, sni: - = none; IPv6 in brackets)
-declare -A GDEF=() GNAMED=() # per TCP group "proto lip lp" with names: GNAMED=1, GDEF=index of its default rule (see group_info)
-SELF_KEPT=0              # 1 when /usr/local/sbin/nginx-stream exists after this run
+declare -A D=()
+RULES=()                 # "proto listen_ip listen host target_port src sni"; * = all, - = none, IPv6 in brackets
+declare -A GDEF=() GNAMED=() # GNAMED=1: TCP group with names; GDEF: index of its default rule
+SELF_KEPT=0
 STAGE=""
 BAKS=() NEWS=()
-APPLIED=0                # 1 from the first file written until the install is verified: errors roll back
+APPLIED=0                # from the first file written until verified: errors roll back
 RESTART_TRIED=0 DEFAULT_LINK="" DEFAULT_UNLINKED=0 FW_TOUCHED=0 PORTS_TOUCHED=0 PORT_TOKENS=""
-NGINX_WAS=0 NGINX_WHY="" # was nginx.conf there before this run; why NGINX_MODE was chosen
-OPEN_TCP=""              # TCP ports (< 10000) listening at install time: kept out of the RST drop
+NGINX_WAS=0 NGINX_WHY="" # NGINX_WAS: nginx.conf existed before; NGINX_WHY: why NGINX_MODE was chosen
+OPEN_TCP=""              # TCP ports < 10000 listening at install time: kept out of the RST drop
 OPEN_HIGH=""             # TCP ports >= 10000 listening at install time: kept out of the ephemeral range
-R_PROTO="" R_LIP="" R_LP="" R_HOST="" R_TP="" R_SRC="" R_SNI="" # result of parse_rule
+R_PROTO="" R_LIP="" R_LP="" R_HOST="" R_TP="" R_SRC="" R_SNI=""
 SSH_PORT="22" BBR=n HAVE_IPV6=n SERVER_IP4="" SERVER_IP6="" PREV_INSTALLED=0 DOMAIN_WARNED=0
 
 # ---------------------------------------------------------------- output
 
-# C_* colour stdout, E_* stderr (warn/die/bad), RL_* go into read -p (readline needs \001..\002 around codes)
+# C_* stdout, E_* stderr, RL_* for read -p (readline needs \001..\002 around codes)
 C_BOLD="" C_CYAN="" C_GRN="" C_RED="" C_DIM="" C_OFF=""
 E_RED="" E_YEL="" E_OFF=""
-RL_BOLD="" RL_DIM="" RL_OFF=""
+RL_BOLD="" RL_DIM="" RL_CYAN="" RL_OFF=""
 
-# colours only on a terminal, not with NO_COLOR (https://no-color.org) or TERM=dumb; stdout and stderr separately
+# no colour with NO_COLOR, TERM=dumb or a non-tty; stdout and stderr are checked separately
 init_colors() {
 	if [[ -n ${NO_COLOR:-} || ${TERM:-dumb} == dumb ]]; then return 0; fi
 	if [[ -t 1 ]]; then
@@ -82,11 +77,11 @@ init_colors() {
 	fi
 	if [[ -t 2 ]]; then
 		E_RED=$'\033[31m' E_YEL=$'\033[33m' E_OFF=$'\033[0m'
-		RL_BOLD=$'\001\033[1m\002' RL_DIM=$'\001\033[2m\002' RL_OFF=$'\001\033[0m\002'
+		RL_BOLD=$'\001\033[1m\002' RL_DIM=$'\001\033[2m\002' RL_CYAN=$'\001\033[36m\002' RL_OFF=$'\001\033[0m\002'
 	fi
 }
 
-# msg RU EN -> the string for the current language (Russian by default)
+# msg RU EN -> the string for the current language
 msg() {
 	if [[ $UI_LANG == en ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi
 }
@@ -95,9 +90,16 @@ say() { printf '%s\n' "$(msg "$1" "$2")"; }
 ok() { printf '%s%s%s\n' "$C_GRN" "$(msg "$1" "$2")" "$C_OFF"; }
 dim() { printf '%s%s%s\n' "$C_DIM" "$(msg "$1" "$2")" "$C_OFF"; }
 hdr() { printf '%s%s%s\n' "$C_BOLD" "$(msg "$1" "$2")" "$C_OFF"; }   # block title
-step() { printf '%s%s%s\n' "$C_CYAN" "$(msg "$1" "$2")" "$C_OFF"; }  # stage of the work
+step() { printf '%s› %s%s\n' "$C_CYAN" "$(msg "$1" "$2")" "$C_OFF"; }  # stage of the work
+li() { printf '  • %s\n' "$(msg "$1" "$2")"; }
+opt() { printf '  %s%s)%s %s\n' "$C_CYAN" "$1" "$C_OFF" "$2"; } # opt N LABEL: a numbered choice
+# row "ru label" "en label" VALUE: labels are pre-padded, printf widths count bytes
+row() { printf '  %s%s%s %s\n' "$C_DIM" "$(msg "$1" "$2")" "$C_OFF" "$3"; }
+yn_word() { if [[ $1 == y ]]; then msg "да" "yes"; else msg "нет" "no"; fi; }
+banner() {
+	printf '\n%snginx-stream%s %sv%s · TCP/UDP relay on nginx%s\n' "$C_BOLD" "$C_OFF" "$C_DIM" "$INSTALLER_VER" "$C_OFF"
+}
 bad() { printf '%s%s%s\n' "$E_RED" "$(msg "$1" "$2")" "$E_OFF" >&2; } # failed check, not fatal
-# a state word coloured: up/active green, DOWN/inactive/failed red
 stc() {
 	case $1 in
 	up | active) printf '%s%s%s' "$C_GRN" "$1" "$C_OFF" ;;
@@ -118,7 +120,7 @@ on_err() {
 	os=$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}") || printf unknown)
 	printf '%sx %s%s\n' "$E_RED" "$(msg "Ошибка (код $rc) в строке $line: $cmd" "Error (code $rc) at line $line: $cmd")" "$E_OFF" >&2
 	printf '  OS: %s, kernel: %s, installer: %s\n' "$os" "$(uname -r 2>/dev/null || echo ?)" "$INSTALLER_VER" >&2
-	# files are already on the system: put the previous state back (main shell only, not inside $(...))
+	# main shell only, not inside $(...)
 	if ((APPLIED)) && [[ $BASHPID == "$$" ]]; then
 		rollback_apply >&2 || true
 	fi
@@ -127,7 +129,7 @@ on_err() {
 POLICY_RC=/usr/sbin/policy-rc.d
 POLICY_SET=0
 
-# remove the temporary policy-rc.d (only if this installer created it)
+# only if this installer created it
 drop_policy_rc() {
 	if ((POLICY_SET)); then
 		rm -f "$POLICY_RC"
@@ -142,11 +144,11 @@ cleanup() {
 	fi
 }
 
-# Ctrl+C, kill, closed terminal: put the previous state back if files are already changed (main shell only)
+# signals: roll back if files are already changed
 on_signal() {
 	if ((APPLIED)) && [[ $BASHPID == "$$" ]]; then
 		APPLIED=0
-		# a closed terminal (HUP) has nowhere to print: output errors must not stop the rollback
+		# HUP: no terminal to print to; output errors must not stop the rollback
 		if [[ $1 == HUP ]]; then rollback_apply >/dev/null 2>&1 || true; else rollback_apply >&2 || true; fi
 	fi
 	exit 130
@@ -319,7 +321,7 @@ init_defaults() {
 	D[UFW_RULES]=""
 }
 
-# Dry-run assumes a typical server; the real run looks at the system.
+# Dry-run assumes a typical server.
 detect_env_defaults() {
 	if ((DRY_RUN)); then
 		HAVE_IPV6=y
@@ -334,7 +336,7 @@ detect_env_defaults() {
 	SERVER_IP4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)
 }
 
-# Previous answers become defaults. Sourced in a subshell: flags given now must not be overwritten.
+# Sourced in a subshell: flags given now must not be overwritten.
 load_previous() {
 	[[ -f $SETTINGS_FILE ]] || return 0
 	PREV_INSTALLED=1
@@ -350,7 +352,6 @@ load_previous() {
 	eval "$dump"
 }
 
-# Status and uninstall work directly with the saved settings.
 load_settings_globals() {
 	local keep=$UI_LANG
 	[[ -f $SETTINGS_FILE ]] || die "nginx-stream не установлен (нет $SETTINGS_FILE)" "nginx-stream is not installed ($SETTINGS_FILE missing)"
@@ -382,7 +383,7 @@ is_ipv6() {
 	[[ $1 == *:*:* && $1 =~ ^[0-9A-Fa-f:.]+$ ]]
 }
 
-# formatted for nginx: IPv6 in brackets
+# IPv6 in brackets, as nginx wants
 fmt_host() {
 	local h
 	h=$(strip_brackets "$1")
@@ -415,12 +416,12 @@ is_domain() {
 	[[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
 }
 
-# SNI zone/name: lower-case labels; the last one is letters (a TLD) or punycode (xn--...); an IP is not a name
+# the last label is alpha (TLD) or punycode: an IP is not a name
 is_sni_domain() {
 	[[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9-]*[a-z0-9])$ ]]
 }
 
-# v_sni_name NAME (already lower-case): a.example.com or *.example.com; syntax only, no DNS
+# v_sni_name NAME (lower-case): a.example.com or *.example.com, syntax only
 v_sni_name() {
 	local n=$1
 	if ((${#n} > 253)); then
@@ -469,10 +470,8 @@ check_domain() {
 	fi
 }
 
-# One rule proto:[listen_ip:]listen[/name][>[host:]port][@src] -> R_PROTO R_LIP (empty = all addresses; IPv4 or [IPv6])
-# R_LP R_SNI (empty = none; lower-case name or *.zone, TCP only) R_HOST (empty = default target, IPv6 in brackets)
-# R_TP R_SRC (empty = none; IPv4 or [IPv6]).
-# Only the syntax is checked here (no DNS), so it is safe to call again from build_rules.
+# One rule proto:[listen_ip:]listen[/name][>[host:]port][@src] -> R_PROTO R_LIP R_LP R_SNI R_HOST R_TP R_SRC
+# (empty = all addresses / none / default target). Syntax only, no DNS: safe to call again from build_rules.
 parse_rule() {
 	local item=$1 body=$1 left tail="" host src="" re_rule='^(tcp|udp|both):([^>]+)(>(.*))?$'
 	R_PROTO="" R_LIP="" R_LP="" R_HOST="" R_TP="" R_SRC="" R_SNI=""
@@ -575,11 +574,11 @@ parse_rule() {
 		warn "Порт вне диапазона 1-65535: $item" "Port out of range 1-65535: $item"
 		return 1
 	fi
-	# 08080 is 8080 (not octal): the same port gives the same duplicate key and nginx listen
+	# 08080 is 8080, not octal: one port, one duplicate key
 	R_LP=$((10#$R_LP)) R_TP=$((10#$R_TP))
 }
 
-# R_SRC must be of the family of the destination (R_HOST or the default target); a domain is only warned about
+# R_SRC must match the destination family; for a domain only a warning
 check_src() {
 	local dest sf df=""
 	dest=$(strip_brackets "${R_HOST:-$TARGET}")
@@ -595,8 +594,7 @@ check_src() {
 	fi
 }
 
-# rules: proto:listen[/name][>[host:]port][@src],...
-# A group is (proto, listen address, listen port): names and at most one rule without a name share it.
+# group = (proto, listen address, port): names and at most one nameless rule share it
 v_ports() {
 	local item p g
 	local -a items
@@ -619,7 +617,7 @@ v_ports() {
 		if [[ -n $R_SRC ]]; then check_src || return 1; fi
 		for p in tcp udp; do
 			if [[ $R_PROTO != both && $R_PROTO != "$p" ]]; then continue; fi
-			# no address = all addresses: conflicts with a group of any other address on the same proto and port
+			# no address = all: conflicts with any address on the same proto and port
 			if [[ -z $R_LIP && -n ${grp_one[$p:$R_LP]:-} ]] || [[ -n $R_LIP && -n ${grp_all[$p:$R_LP]:-} ]]; then
 				warn "Повтор $p:${R_LIP:+$R_LIP:}$R_LP" "Duplicate $p:${R_LIP:+$R_LIP:}$R_LP"
 				return 1
@@ -659,7 +657,7 @@ setup_tty() {
 		exec </dev/tty
 		return 0
 	fi
-	# "soft": the caller has a safe answer for a missing terminal
+	# "soft": the caller has a safe answer without a terminal
 	if ((!YES)) && [[ ${1:-} != soft ]]; then
 		die "Нет терминала для вопросов: запустите с --yes и флагами (см. --help)" \
 			"No terminal for questions: run with --yes and flags (see --help)"
@@ -670,7 +668,7 @@ bad_value() {
 	die "Недопустимое значение для $1" "Invalid value for $1"
 }
 
-# ask VAR "ru" "en" validator   (flag value wins, then --yes default, then the prompt)
+# ask VAR "ru" "en" validator   (flag > --yes default > prompt)
 ask() {
 	local var=$1 ru=$2 en=$3 check=$4 val=${!1:-} def=${D[$1]:-}
 	if [[ -n $val ]]; then
@@ -682,8 +680,11 @@ ask() {
 		printf -v "$var" '%s' "$def"
 		return 0
 	fi
+	printf '\n'
+	hdr "$ru" "$en"
+	if [[ -n ${5:-} ]]; then "$5"; fi
 	while :; do
-		read -r -e -p "$RL_BOLD$(msg "$ru" "$en")$RL_OFF: " -i "$def" val || die "Ввод прерван" "Input aborted"
+		read -r -e -p "$RL_CYAN>$RL_OFF " -i "$def" val || die "Ввод прерван" "Input aborted"
 		if "$check" "$val"; then break; fi
 	done
 	printf -v "$var" '%s' "$val"
@@ -703,9 +704,11 @@ ask_yn() {
 		printf -v "$var" '%s' "$def"
 		return 0
 	fi
-	if (($# > 3)); then dim "$4" "$5"; fi
+	printf '\n'
+	hdr "$ru" "$en"
+	if (($# > 3)); then dim "  $4" "  $5"; fi
 	while :; do
-		read -r -e -p "$RL_BOLD$(msg "$ru" "$en")$RL_OFF ${RL_DIM}[y/n]$RL_OFF: " -i "$def" val || die "Ввод прерван" "Input aborted"
+		read -r -e -p "$RL_CYAN>$RL_OFF ${RL_DIM}(y/n)$RL_OFF " -i "$def" val || die "Ввод прерван" "Input aborted"
 		val=$(norm_yn "$val")
 		if v_yn "$val"; then break; fi
 		say "Ответьте y или n." "Answer y or n."
@@ -737,10 +740,10 @@ choose() {
 		rest=${opts[i]#*|}
 		lr=${rest%%|*}
 		le=${rest#*|}
-		printf '  %d) %s\n' $((i + 1)) "$(msg "$lr" "$le")"
+		opt $((i + 1)) "$(msg "$lr" "$le")"
 	done
 	while :; do
-		read -r -e -p "> " -i "$defn" pick || die "Ввод прерван" "Input aborted"
+		read -r -e -p "$RL_CYAN>$RL_OFF " -i "$defn" pick || die "Ввод прерван" "Input aborted"
 		if [[ $pick =~ ^[0-9]+$ ]] && ((pick >= 1 && pick <= ${#opts[@]})); then
 			printf -v "$var" '%s' "${opts[pick - 1]%%|*}"
 			return 0
@@ -749,7 +752,7 @@ choose() {
 	done
 }
 
-# confirm "ru" "en" default(y|n) -> 0 for yes; with --yes the default is taken
+# confirm "ru" "en" default(y|n) -> 0 for yes
 confirm() {
 	local ans def=${3:-n}
 	if ((YES)); then
@@ -757,8 +760,8 @@ confirm() {
 		return
 	fi
 	while :; do
-		if ! read -r -e -p "$RL_BOLD$(msg "$1" "$2")$RL_OFF ${RL_DIM}[y/n]$RL_OFF: " -i "$def" ans; then
-			# 4th argument "soft": end of input means the default answer instead of aborting
+		if ! read -r -e -p "$RL_BOLD$(msg "$1" "$2")$RL_OFF ${RL_DIM}(y/n)$RL_OFF " -i "$def" ans; then
+			# "soft": end of input means the default answer, not abort
 			if [[ ${4:-} == soft ]]; then
 				printf '\n'
 				ans=$def
@@ -782,9 +785,11 @@ ask_lang() {
 	UI_LANG=${D[UI_LANG]:-ru}
 	if ((YES)); then return 0; fi
 	if [[ $UI_LANG == en ]]; then defn=2; fi
-	printf '\n%sLanguage / Язык:%s\n  1) Русский\n  2) English\n' "$C_BOLD" "$C_OFF"
+	printf '\n%sLanguage / Язык%s\n' "$C_BOLD" "$C_OFF"
+	opt 1 Русский
+	opt 2 English
 	while :; do
-		read -r -e -p "> " -i "$defn" pick || die "Ввод прерван" "Input aborted"
+		read -r -e -p "$RL_CYAN>$RL_OFF " -i "$defn" pick || die "Ввод прерван" "Input aborted"
 		case $pick in
 		1) UI_LANG=ru ;;
 		2) UI_LANG=en ;;
@@ -794,46 +799,53 @@ ask_lang() {
 	done
 }
 
+target_hint() {
+	dim "  IPv4, IPv6 или домен: куда передавать соединения" "  IPv4, IPv6 or a domain: where connections go"
+}
+
+ports_hint() {
+	dim "  proto:порт[/имя][>[хост:]порт_цели][@адрес] через запятую; proto - tcp, udp или both" \
+		"  proto:port[/name][>[host:]target_port][@address], comma separated; proto is tcp, udp or both"
+	dim "    tcp:443                         TCP 443 -> тот же порт сервера назначения" \
+		"    tcp:443                         TCP 443 -> the same port of the destination"
+	dim "    udp:8443>443                    UDP 8443 -> порт 443" "    udp:8443>443                    UDP 8443 -> port 443"
+	dim "    tcp:2222>203.0.113.20:22        на другой сервер" "    tcp:2222>203.0.113.20:22        to another server"
+	dim "    udp:51820>[2001:db8::20]:51820  IPv6 - в квадратных скобках" \
+		"    udp:51820>[2001:db8::20]:51820  IPv6 in square brackets"
+	dim "    tcp:443/a.example.com>203.0.113.5:443,tcp:443>203.0.113.9:443  по имени сайта (TLS)" \
+		"    tcp:443/a.example.com>203.0.113.5:443,tcp:443>203.0.113.9:443  by site name (TLS)"
+	dim "  Адрес слушания и исходящий адрес (@) - в README." "  Listen and outgoing (@) addresses: see the README."
+}
+
 ask_all() {
 	ask_lang
-	# in the dialog the address is required (otherwise the rules question would loop with no way back);
-	# an empty --target with a host in every rule is for flags only
+	# required in the dialog, or the rules question would loop with no way back;
+	# an empty --target (a host in every rule) is for flags only
 	local tcheck=v_target
 	if ((YES)); then tcheck=v_target_opt; fi
-	ask TARGET "Адрес сервера назначения (IPv4, IPv6 или домен)" \
-		"Destination address (IPv4, IPv6 or domain)" "$tcheck"
+	ask TARGET "Адрес сервера назначения" "Destination address" "$tcheck" target_hint
 	TARGET=$(strip_brackets "$TARGET")
-	if [[ -z $PORTS ]] && ((!YES)); then
-		printf '\n'
-		dim "Правила: proto:порт_здесь[/имя][>[хост:]порт_цели][@src], через запятую; proto - tcp, udp или both." \
-			"Rules: proto:listen_port[/name][>[host:]target_port][@src], comma separated; proto is tcp, udp or both."
-		dim "  tcp:443 | both:443 | udp:8443>443 | tcp:2222>203.0.113.20:22 | udp:51820>[2001:db8::20]:51820" \
-			"  tcp:443 | both:443 | udp:8443>443 | tcp:2222>203.0.113.20:22 | udp:51820>[2001:db8::20]:51820"
-		dim "Без хоста правило идёт на адрес по умолчанию; IPv6 пишется в квадратных скобках." \
-			"A rule without a host goes to the default address; IPv6 is written in square brackets."
-		dim "  с адресом слушания: udp:192.0.2.20:443>[2001:db8::20]:443" "  with a listen address: udp:192.0.2.20:443>[2001:db8::20]:443"
-		dim "  с исходящим адресом (@): udp:443>[2001:db8::21]:443@[2001:db8::5]" "  with an outgoing address (@): udp:443>[2001:db8::21]:443@[2001:db8::5]"
-		dim "  по имени (SNI, только TCP с TLS): tcp:443/a.example.com>203.0.113.5:443,tcp:443>203.0.113.9:443" \
-			"  by name (SNI, TCP with TLS only): tcp:443/a.example.com>203.0.113.5:443,tcp:443>203.0.113.9:443"
-	fi
-	ask PORTS "Правила портов" "Port rules" v_ports
-	choose LISTEN "Слушать:" "Listen on:" \
+	ask PORTS "Правила портов" "Port rules" v_ports ports_hint
+	choose LISTEN "На каких адресах слушать?" "Listen on which addresses?" \
 		"v4|только IPv4|IPv4 only" \
 		"v4v6|IPv4 и IPv6|IPv4 and IPv6"
 	ask_yn PROXY_PROTOCOL "Включить PROXY protocol к серверу назначения?" "Send PROXY protocol to the destination?" \
-		"Сервер назначения обязан его принимать, иначе соединения сломаются." \
-		"The destination must accept it, otherwise connections break."
-	choose LOGS "Журнал nginx:" "nginx log:" \
+		"Передаёт серверу назначения адрес клиента. Только если сервер это принимает: иначе соединения ломаются." \
+		"Passes the client address to the destination. Only if it accepts that: otherwise connections break."
+	choose LOGS "Журнал nginx" "nginx log" \
 		"off|нет|none" \
 		"error|только ошибки|errors only"
-	ask_yn TUNE "Настроить параметры ядра (sysctl, BBR)?" "Tune kernel parameters (sysctl, BBR)?"
+	ask_yn TUNE "Настроить параметры ядра?" "Tune kernel parameters?" \
+		"Больше соединений, сетевые буферы, BBR. Что ядро не даёт поменять, пропускается." \
+		"More connections, network buffers, BBR. What the kernel does not allow is skipped."
 	ask_yn SSH_PROTECT "Защитить SSH от перебора?" "Protect SSH from brute force?" \
-		"После 10 новых подключений к SSH за минуту с одной /24 (IPv6: /64) лишние отбрасываются." \
-		"After 10 new SSH connections per minute from one /24 (IPv6: /64) extra ones are dropped."
+		"Не больше 10 новых подключений в минуту с одной сети (/24, IPv6: /64): подбор пароля бесполезен." \
+		"At most 10 new connections a minute from one network (/24, IPv6: /64): password guessing is pointless."
 	ask_yn SCAN_PROTECT "Защита от сканирования?" "Scan protection?" \
-		"Сервер перестанет отвечать на ping и на закрытые порты. Службы, запущенные позже на портах ниже 10000, не будут отвечать RST (клиенты ждут таймаут), пока не перезапустить установщик." \
-		"The server will stop answering ping and closed ports. Services started later on ports below 10000 will not send RST (clients wait for a timeout) until the installer is run again."
-	ask_yn AUTO_UPDATES "Включить автообновления безопасности?" "Enable unattended security updates?"
+		"Сервер не отвечает на ping и закрытые порты. Новой службе на порту ниже 10000 нужен перезапуск установщика." \
+		"The server ignores ping and closed ports. A new service on a port below 10000 needs a rerun of the installer."
+	ask_yn AUTO_UPDATES "Включить автообновления безопасности?" "Enable unattended security updates?" \
+		"Обновления безопасности ставятся сами, без перезагрузки." "Security updates install themselves, without a reboot."
 	: "${TCP_TIMEOUT:=${D[TCP_TIMEOUT]}}" "${UDP_TIMEOUT:=${D[UDP_TIMEOUT]}}"
 	v_timeout "$TCP_TIMEOUT" || bad_value --tcp-timeout
 	v_timeout "$UDP_TIMEOUT" || bad_value --udp-timeout
@@ -843,7 +855,6 @@ ask_all() {
 
 add_rule() { RULES+=("$1 $2 $3 $4 $5 $6 $7"); }
 
-# 0 if some rule has the given proto (tcp|udp)
 has_proto() {
 	local rule
 	for rule in "${RULES[@]}"; do
@@ -852,7 +863,6 @@ has_proto() {
 	return 1
 }
 
-# 0 if some rule has a name (SNI)
 has_sni() {
 	local rule proto lip lp host tp src sni
 	for rule in "${RULES[@]}"; do
@@ -862,7 +872,7 @@ has_sni() {
 	return 1
 }
 
-# Groups with names (GNAMED) and the default rule of each (GDEF): the rule without a name, else the first one with a name.
+# fills GNAMED and GDEF; default = the nameless rule, else the first named one
 group_info() {
 	local i gk proto lip lp host tp src sni
 	local -A plain=() first=()
@@ -882,7 +892,7 @@ group_info() {
 	done
 }
 
-# rule_line INDEX: "tcp 443 [name] -> host:port from src (default)" (group_info first)
+# rule_line INDEX: "tcp 443 [name] -> host:port from src (default)"; needs group_info first
 rule_line() {
 	local proto lip lp host tp src sni gk nm="" df=""
 	read -r proto lip lp host tp src sni <<<"${RULES[$1]}"
@@ -897,10 +907,10 @@ rule_line() {
 	fi
 }
 
-# "lp" or "listen_ip:lp" for messages; $1 = listen_ip (* = all), $2 = port
+# $1 listen_ip (* = all), $2 port -> "lp" or "listen_ip:lp"
 fmt_lp() { if [[ $1 == "*" ]]; then printf '%s' "$2"; else printf '%s:%s' "$1" "$2"; fi; }
 
-# " from ADDR" for messages; $1 = src of a rule (- = none)
+# $1 src (- = none) -> " from ADDR"
 src_note() {
 	local a
 	if [[ -z $1 || $1 == "-" ]]; then return 0; fi
@@ -908,7 +918,6 @@ src_note() {
 	msg " с $a" " from $a"
 }
 
-# distinct outgoing (@src) addresses of the rules, space separated
 src_addrs() {
 	local rule proto lip lp host tp src sni
 	for rule in "${RULES[@]}"; do
@@ -918,7 +927,6 @@ src_addrs() {
 	done | sort -u | paste -sd' ' -
 }
 
-# distinct listen addresses of the rules (space separated, empty if no rule has one)
 listen_addrs() {
 	local rule proto lip lp host tp src sni
 	for rule in "${RULES[@]}"; do
@@ -942,8 +950,7 @@ build_rules() {
 	done
 }
 
-# distinct listen ports >= 10000, and the ports >= 10000 something listens on at install time (OPEN_HIGH):
-# outgoing connections must not take them
+# listen ports >= 10000 and OPEN_HIGH: outgoing connections must not take them
 reserved_ports() {
 	local rule proto lip lp host tp src sni
 	{
@@ -955,7 +962,6 @@ reserved_ports() {
 	} | sort -un | paste -sd, -
 }
 
-# distinct "port/proto" of all listens
 rule_ports() {
 	local rule proto lip lp host tp src sni
 	for rule in "${RULES[@]}"; do
@@ -972,12 +978,12 @@ render_nginx_conf() {
 	local errlog="/dev/null crit"
 	if [[ $LOGS == error ]]; then errlog="/var/log/nginx/error.log warn"; fi
 	emit "# nginx-stream - https://github.com/drno88/nginx-stream"
-	emit "# Generated by the installer; the previous file is nginx.conf.before-nginx-stream."
+	emit "# Generated; the previous file is nginx.conf.before-nginx-stream."
 	emit "user www-data;"
 	emit "worker_processes auto;"
 	emit "worker_rlimit_nofile 262144;"
 	if has_proto udp; then
-		emit "# without it old workers keep UDP sessions forever after a reload (clients send keepalives)"
+		emit "# without it old workers keep UDP sessions after a reload (clients keep sending)"
 		emit "worker_shutdown_timeout 10s;"
 	fi
 	emit "pid /run/nginx.pid;"
@@ -992,7 +998,7 @@ render_nginx_conf() {
 	emit "$NGX_INCLUDE_LINE"
 }
 
-# Shared mode: stdin = current nginx.conf, stdout = the same with our include added once.
+# Shared mode: stdin nginx.conf -> stdout with our include added once.
 render_shared_main() {
 	local conf
 	conf=$(cat)
@@ -1004,19 +1010,19 @@ render_shared_main() {
 			!done && /^[ \t]*include[ \t]+\/etc\/nginx\/modules-enabled\/\*\.conf;/ { print mark; print inc; done = 1 }
 		' <<<"$conf"
 	else
-		# at the end: before a load_module line the include would make nginx -t fail (load_module must come first)
+		# at the end: an include before load_module makes nginx -t fail
 		printf '%s\n%s\n%s\n' "$conf" "$INCLUDE_MARK" "$NGX_INCLUDE_LINE"
 	fi
 }
 
-# ensure_upstream PROTO HOST PORT: the upstream block is emitted once per (proto, host, port); its name is left in UP_NAME.
-# upname and upused belong to the calling render_stream_conf.
+# ensure_upstream PROTO HOST PORT: one upstream block per triple, its name in UP_NAME
+# (upname, upused: the calling render_stream_conf variables)
 ensure_upstream() {
 	local proto=$1 host=$2 tp=$3 hk hs name n=1
 	hk=$(strip_brackets "$host")
 	hk=${hk,,}
 	if [[ -z ${upname[$proto $hk $tp]:-} ]]; then
-		# the name comes from host_safe; another host with the same name gets _2, _3...
+		# host_safe can collide: the next such host gets _2, _3...
 		hs=$(host_safe "$hk")
 		name=${proto}_${hs}_${tp}
 		while [[ -n ${upused[$name]:-} ]]; do
@@ -1054,11 +1060,10 @@ emit_listens() {
 	done
 }
 
-# the proxy_* lines of a server after proxy_pass / proxy_bind
 emit_proxy_opts() {
 	if [[ $1 == tcp ]]; then
 		emit "${T}${T}proxy_connect_timeout 5s;"
-		emit "${T}${T}proxy_timeout $TCP_TIMEOUT;${T}# idle without a single byte: close"
+		emit "${T}${T}proxy_timeout $TCP_TIMEOUT;${T}# closes idle connections"
 		emit "${T}${T}proxy_socket_keepalive on;"
 		emit "${T}${T}proxy_buffer_size 64k;${T}# default 16k: extra syscalls on a fat stream"
 		if [[ $PROXY_PROTOCOL == y ]]; then emit "${T}${T}proxy_protocol on;"; fi
@@ -1077,9 +1082,8 @@ map_rows() {
 	done
 }
 
-# One server per group with names: a map picks the upstream (and the outgoing address) by the TLS server name.
-# Values of the maps are upstream names, not host:port: a domain in a variable would need a resolver.
-# gmem belongs to the calling render_stream_conf.
+# One server per group with names: maps pick the upstream (and outgoing address) by TLS server name.
+# Maps hold upstream names, not host:port: a domain in a variable would need a resolver.
 emit_named_group() {
 	local gk=$1 proto lip lp i def vs w d dsrc v hassrc=0 host tp src sni
 	local -a idx up_of=() rows=() srows=()
@@ -1102,7 +1106,7 @@ emit_named_group() {
 		if ((${#sni} + 2 > w)); then w=$((${#sni} + 2)); fi
 	done
 	emit ""
-	emit "${T}# the name in the TLS ClientHello (SNI) picks the destination; no name, another name or not TLS goes to default"
+	emit "${T}# SNI picks the destination; no name, another name or not TLS goes to default"
 	emit "${T}map \$ssl_preread_server_name \$ns_up_$vs {"
 	emit "${T}${T}hostnames;"
 	map_rows "$w" "${rows[@]}"
@@ -1115,7 +1119,7 @@ emit_named_group() {
 			read -r d d d d d src sni <<<"${RULES[i]}"
 			if [[ $sni == "-" ]]; then continue; fi
 			if [[ $src == "-" ]]; then v='""'; else v=$(strip_brackets "$src"); fi
-			# every name gets its own row, even one equal to default: a *.zone with another @ must not cover it
+			# a row per name even if equal to default: a *.zone with another @ must not cover it
 			srows+=("$sni" "$v")
 		done
 		emit ""
@@ -1130,7 +1134,7 @@ emit_named_group() {
 	emit_listens tcp "$lip@$lp"
 	emit "${T}${T}ssl_preread on;"
 	emit "${T}${T}proxy_pass \$ns_up_$vs;"
-	if ((hassrc)); then emit "${T}${T}proxy_bind \$ns_src_$vs;${T}# outgoing address to the destination"; fi
+	if ((hassrc)); then emit "${T}${T}proxy_bind \$ns_src_$vs;${T}# outgoing address"; fi
 	emit_proxy_opts tcp
 	emit "${T}}"
 }
@@ -1174,8 +1178,7 @@ render_stream_conf() {
 		emit "${T}map_hash_bucket_size $bucket;${T}# room for long host names in the maps"
 	fi
 	emit ""
-	emit "${T}# max_fails=0: if a domain gives both IPv4 and IPv6, without it nginx takes one address out for"
-	emit "${T}# fail_timeout after a short failure and sends everybody to the other; the client retries a dropped connection"
+	emit "${T}# max_fails=0: a short failure must not take one address of a dual-stack domain out"
 	for entry in "${order[@]}"; do
 		if [[ ${entry:0:1} == G ]]; then
 			emit_named_group "${entry:1}"
@@ -1188,13 +1191,12 @@ render_stream_conf() {
 		emit ""
 		if [[ $proto == udp && $udp_noted == 0 ]]; then
 			udp_noted=1
-			emit "${T}# reuseport is required: without it datagrams of one client are spread over workers,"
-			emit "${T}# each with its own outgoing socket, and the server sees fragments of different sessions"
+			emit "${T}# reuseport: else one client's datagrams spread over workers and the server sees mixed sessions"
 		fi
 		emit "${T}server {"
 		emit_listens "$proto" "${listens[$key]}"
 		emit "${T}${T}proxy_pass $UP_NAME;"
-		if [[ $src != "-" ]]; then emit "${T}${T}proxy_bind $(strip_brackets "$src");${T}# outgoing address to the destination"; fi
+		if [[ $src != "-" ]]; then emit "${T}${T}proxy_bind $(strip_brackets "$src");${T}# outgoing address"; fi
 		emit_proxy_opts "$proto"
 		emit "${T}}"
 	done
@@ -1222,7 +1224,7 @@ render_sysctl() {
 	low=$((high / 3))
 	press=$((2 * high / 3))
 	reserved=$(reserved_ports)
-	emit "# nginx-stream: kernel parameters for a relay (generated; applied with: sysctl -e -p <this file>)"
+	emit "# nginx-stream: relay kernel parameters (apply: sysctl -e -p <this file>)"
 	emit ""
 	if [[ $bbr == y ]]; then
 		emit "# BBR + fq: better throughput on lossy long-distance paths"
@@ -1240,7 +1242,7 @@ render_sysctl() {
 	emit "net.ipv4.tcp_rmem = $bufs"
 	emit "net.ipv4.tcp_wmem = $bufs"
 	emit ""
-	emit "# total TCP memory: 14% of RAM in 4 KB pages, thresholds 1:2:3 (the kernel default is too low on 1 GB; above ~14% risks OOM)"
+	emit "# total TCP memory: 14% of RAM in 4 KB pages (kernel default is too low on 1 GB; more risks OOM)"
 	emit "net.ipv4.tcp_mem = $low $press $high"
 	emit ""
 	emit "# queues: many simultaneous connections"
@@ -1248,16 +1250,15 @@ render_sysctl() {
 	emit "net.core.somaxconn = 65535"
 	emit "net.ipv4.tcp_max_syn_backlog = 8192"
 	emit ""
-	emit "# outgoing ports: a wide range, and our listen ports >= 10000 must not be taken by outgoing connections"
+	emit "# wide outgoing range; our listen ports >= 10000 are reserved against it"
 	emit "net.ipv4.ip_local_port_range = 10000 65535"
 	if [[ -n $reserved ]]; then emit "net.ipv4.ip_local_reserved_ports = $reserved"; fi
 	emit ""
-	emit "# TCP behaviour on a relay"
 	emit "net.ipv4.tcp_mtu_probing = 1"
 	emit "net.ipv4.tcp_slow_start_after_idle = 0"
 	emit "net.ipv4.tcp_notsent_lowat = 131072"
 	emit ""
-	emit "# dead peers are noticed in about 11 minutes, closed sockets are released sooner"
+	emit "# dead peers noticed in ~11 min; closed sockets released sooner"
 	emit "net.ipv4.tcp_keepalive_time = 600"
 	emit "net.ipv4.tcp_keepalive_intvl = 30"
 	emit "net.ipv4.tcp_keepalive_probes = 3"
@@ -1293,8 +1294,7 @@ render_firewall() {
 	if [[ $SSH_PROTECT == y ]]; then
 		# No "ct state": it would load conntrack for all relay traffic ("table full" on small RAM).
 		# Syntax is checked with `nft -c -f` before applying (apply()); if rejected, the protection is switched off.
-		emit "${T}${T}# ssh-protect: more than 10 new connections per minute from one /24 (IPv6: /64) are dropped;"
-		emit "${T}${T}# a new connection is a bare SYN, sets forget a network after 2 minutes of silence"
+		emit "${T}${T}# ssh-protect: >10 new connections/min from one /24 (IPv6: /64) are dropped (bare SYN, no conntrack)"
 		emit "${T}${T}tcp dport $dp tcp flags & (fin|syn|rst|ack) == syn update @ssh4 { ip saddr and 255.255.255.0 limit rate over 10/minute burst 10 packets } drop"
 		emit "${T}${T}tcp dport $dp tcp flags & (fin|syn|rst|ack) == syn update @ssh6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 10/minute burst 10 packets } drop"
 	fi
@@ -1310,7 +1310,7 @@ render_firewall() {
 				for p in "${sp[@]}"; do
 					if ((p < 10000)); then printf '%s\n' "$p"; fi
 				done
-				# TCP ports listening right now (empty in dry-run)
+				# listening now (empty in dry-run)
 				if [[ -n $OPEN_TCP ]]; then tr ' ' '\n' <<<"$OPEN_TCP"; fi
 				for rule in "${RULES[@]}"; do
 					read -r proto lip lp host tp src sni <<<"$rule"
@@ -1320,9 +1320,8 @@ render_firewall() {
 		)
 		emit "${T}chain output {"
 		emit "${T}${T}type filter hook output priority -10; policy accept;"
-		emit "${T}${T}# scan-protect: no RST from closed ports. RST from nginx (listen ports and ephemeral 10000-65535), SSH and"
-		emit "${T}${T}# the TCP ports listening at install time are kept, otherwise connections dropped by a service would hang"
-		emit "${T}${T}# at the peer until a timeout; services started later on ports < 10000 need the installer run again"
+		emit "${T}${T}# scan-protect: no RST from closed ports, except nginx (listen and 10000-65535), SSH and TCP ports"
+		emit "${T}${T}# listening at install time (else their dropped connections hang); newer services need a rerun"
 		emit "${T}${T}tcp flags & rst == rst tcp sport != { ${low:+$low, }10000-65535 } drop"
 		emit "${T}${T}icmp type destination-unreachable icmp code port-unreachable drop"
 		emit "${T}${T}icmpv6 type destination-unreachable icmpv6 code port-unreachable drop"
@@ -1334,7 +1333,7 @@ render_firewall() {
 render_firewall_unit() {
 	emit "[Unit]"
 	emit "Description=nginx-stream firewall (own nftables table)"
-	emit "# nftables.service runs flush ruleset: after its restart or reload our table is loaded again (start: its drop-in)"
+	emit "# nftables.service flushes the ruleset: our table is loaded again after its restart/reload (start: drop-in)"
 	emit "After=network-pre.target nftables.service"
 	emit "PartOf=nftables.service"
 	emit "ReloadPropagatedFrom=nftables.service"
@@ -1350,8 +1349,8 @@ render_firewall_unit() {
 	emit "WantedBy=multi-user.target"
 }
 
-# Drop-in for nftables.service: PartOf passes on stop and restart only, so after every start of nftables (the first
-# one included, while our units are still active) they are restarted. --no-block: they are ordered after nftables.
+# PartOf covers stop/restart only: after every start of nftables (our units may be active already) restart them.
+# --no-block: they are ordered after nftables.
 render_nft_dropin() {
 	local units="nginx-stream-ports.service"
 	if need_firewall; then units="nginx-stream-firewall.service $units"; fi
@@ -1360,16 +1359,16 @@ render_nft_dropin() {
 	emit "ExecStartPost=-/bin/systemctl --no-block restart $units"
 }
 
-# render_ports_script TOKEN...: sh script that opens the relay ports in the input filters found when it runs
-# (token = proto:port:fam, fam 4, 6 or 46). "up" is run at boot and when the other firewall restarts.
+# render_ports_script TOKEN...: sh script opening the relay ports in the input filters found when it runs
+# (token = proto:port:fam, fam 4|6|46). "up" runs at boot and when the other firewall restarts.
 render_ports_script() {
 	emit "#!/bin/sh"
-	emit "# nginx-stream: opens the relay ports in iptables and in foreign nftables input chains (rules marked nginx-stream)"
+	emit "# nginx-stream: opens relay ports in iptables and foreign nft input chains (rules marked nginx-stream)"
 	emit "PORTS='$*'"
 	cat <<'EOF'
 rc=0
 
-# ports_for FAMILY: proto:port of the tokens that fit the table family (4, 6 or 46), without duplicates
+# ports_for FAMILY (4|6|46): proto:port of the fitting tokens, unique
 ports_for() {
 	for t in $PORTS; do
 		f=${t##*:}
@@ -1398,15 +1397,13 @@ down() {
 	done
 }
 
-# Where the ACCEPT goes: not first (it would bypass the owner's bans "-s X -j DROP" and block sets), but where the
-# chain would close the port: before its final catch-all DROP/REJECT, or at the end if only the policy is DROP.
-# A chain that accepts by default and has no final catch-all drop has the ports open already: nothing is added.
+# ACCEPT goes before the final catch-all DROP/REJECT, or at the end if only the policy drops; not first:
+# that would bypass the owner's bans (-s X -j DROP, sets). A chain open by default needs nothing.
 
 # ipt_up BIN FAMILY
 ipt_up() {
 	command -v "$1" >/dev/null 2>&1 || return 0
-	# "I N": the last -A INPUT rule is a bare DROP/REJECT (a comment and an input interface allowed) and is rule
-	# number N; "A": policy DROP; "N": nothing to do
+	# "I N": the last rule N is a bare DROP/REJECT (comment, input interface allowed); "A": policy DROP; "N": none
 	where=$("$1" -w 5 -S INPUT 2>/dev/null | awk '
 		/^-P INPUT / { pol = $3 }
 		/^-A INPUT / { n++; last = $0; lastn = n }
@@ -1426,9 +1423,8 @@ ipt_up() {
 	done
 }
 
-# nft_up: every foreign base chain of the input hook (not iptables-nft's INPUT: iptables owns it). The last rule
-# is a bare drop/reject (counter, log, comment, input interface allowed): insert before it, by its handle. No such rule
-# and policy drop: add to the end. Otherwise the chain lets the ports through already.
+# nft_up: foreign base chains of the input hook (not iptables-nft's INPUT: iptables owns it): insert by handle
+# before the final bare drop/reject (counter, log, comment, iif allowed); with only policy drop, add at the end.
 nft_up() {
 	command -v nft >/dev/null 2>&1 || return 0
 	for c in $(nft -a list ruleset 2>/dev/null | awk '
@@ -1482,10 +1478,10 @@ nft_up() {
 	done
 }
 
-# ufw has the ports open by its own rules (the installer adds them); our ACCEPT in INPUT would bypass its denies
+# ufw: the installer adds its own rules; our INPUT ACCEPT would bypass its denies
 ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; }
 
-# firewalld: the ports are only printed by the installer; its reload would wipe our rules, so none are added
+# firewalld: ports are only printed; its reload would wipe our rules
 firewalld_active() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld; }
 
 up() {
@@ -1513,8 +1509,7 @@ EOF
 render_ports_unit() {
 	emit "[Unit]"
 	emit "Description=nginx-stream: relay ports open in the host firewall"
-	emit "# own unit, not a saved ruleset snapshot; it follows the other firewall: restart, reload, stop + start"
-	emit "# (start of nftables: its drop-in)"
+	emit "# follows the other firewall: restart, reload, stop + start (start of nftables: its drop-in)"
 	emit "After=network-pre.target nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service firewalld.service"
 	emit "PartOf=nftables.service netfilter-persistent.service"
 	emit "ReloadPropagatedFrom=nftables.service netfilter-persistent.service"
@@ -1541,7 +1536,7 @@ render_settings() {
 	done
 }
 
-# render_all DIR: every file of the install under its dry-run name. Real install copies from here.
+# render_all DIR: every install file under its dry-run name; the real install copies from here.
 render_all() {
 	local d=$1
 	mkdir -p "$d"
@@ -1570,24 +1565,33 @@ render_all() {
 # ---------------------------------------------------------------- summary
 
 show_choices() {
-	local i why_ru why_en
-	printf '\n'
-	hdr "Выбрано:" "Selected:"
-	say "  назначение:   ${TARGET:--}" "  destination:  ${TARGET:--}"
-	say "  слушать:      $LISTEN" "  listen:       $LISTEN"
+	local i why_ru why_en mode_ru mode_en listen_ru listen_en logs_ru logs_en
 	case $NGINX_WHY in
 	fresh) why_ru="nginx ставится этим запуском" why_en="nginx is installed by this run" ;;
 	ours) why_ru="nginx.conf уже наш" why_en="nginx.conf is already ours" ;;
 	settings) why_ru="как при прошлой установке" why_en="as in the previous install" ;;
-	changed) why_ru="nginx.conf изменён после установки: не заменяется, добавляется include" why_en="nginx.conf was changed after the install: it is kept, only an include is added" ;;
-	pristine) why_ru="nginx.conf, default-сайт и conf.d пакетные" why_en="nginx.conf, default site and conf.d are the package ones" ;;
-	*) why_ru="в nginx есть чужие настройки: nginx.conf не заменяется, добавляется include" why_en="nginx has foreign settings: nginx.conf is kept, only an include is added" ;;
+	changed) why_ru="nginx.conf изменён после установки, добавляется include" why_en="nginx.conf was changed after the install, an include is added" ;;
+	pristine) why_ru="на nginx ничего нет, кроме пакетного" why_en="nginx has nothing but the package config" ;;
+	*) why_ru="nginx уже обслуживает сайты, добавляется include" why_en="nginx already serves sites, an include is added" ;;
 	esac
-	say "  режим nginx:  $NGINX_MODE ($why_ru)" "  nginx mode:   $NGINX_MODE ($why_en)"
-	say "  PROXY proto:  $PROXY_PROTOCOL; журнал: $LOGS" "  PROXY proto:  $PROXY_PROTOCOL; log: $LOGS"
-	say "  ядро: $TUNE; SSH-защита: $SSH_PROTECT; защита от сканирования: $SCAN_PROTECT; автообновления: $AUTO_UPDATES" \
-		"  kernel: $TUNE; SSH protect: $SSH_PROTECT; scan protect: $SCAN_PROTECT; auto updates: $AUTO_UPDATES"
-	hdr "  правила:" "  rules:"
+	mode_ru="свой" mode_en="own"
+	if [[ $NGINX_MODE == shared ]]; then mode_ru="общий" mode_en="shared"; fi
+	listen_ru="IPv4 и IPv6" listen_en="IPv4 and IPv6"
+	if [[ $LISTEN == v4 ]]; then listen_ru="только IPv4" listen_en="IPv4 only"; fi
+	logs_ru="нет" logs_en="none"
+	if [[ $LOGS == error ]]; then logs_ru="только ошибки" logs_en="errors only"; fi
+	printf '\n'
+	hdr "Сводка" "Summary"
+	row "Сервер назначения      " "Destination            " "${TARGET:--}"
+	row "Слушать                " "Listen on              " "$(msg "$listen_ru" "$listen_en")"
+	row "Режим nginx            " "nginx mode             " "$(msg "$mode_ru - $why_ru" "$mode_en - $why_en")"
+	row "PROXY protocol         " "PROXY protocol         " "$(yn_word "$PROXY_PROTOCOL")"
+	row "Журнал nginx           " "nginx log              " "$(msg "$logs_ru" "$logs_en")"
+	row "Параметры ядра         " "Kernel tuning          " "$(yn_word "$TUNE")"
+	row "Защита SSH             " "SSH protection         " "$(yn_word "$SSH_PROTECT")"
+	row "Защита от сканирования " "Scan protection        " "$(yn_word "$SCAN_PROTECT")"
+	row "Автообновления         " "Security updates       " "$(yn_word "$AUTO_UPDATES")"
+	row "Правила                " "Rules                  " ""
 	group_info
 	for ((i = 0; i < ${#RULES[@]}; i++)); do
 		printf '    %s\n' "$(rule_line "$i")"
@@ -1598,13 +1602,13 @@ show_choices() {
 final_report() {
 	local rule i cmd ip=${SERVER_IP4:-"<IPv4 этого сервера>"} addrs la a
 	if [[ $UI_LANG == en && -z $SERVER_IP4 ]]; then ip="<this server's IPv4>"; fi
-	# connections to the destination leave from the server's main addresses (by route), not from listen addresses
+	# outgoing connections use the main addresses (by route), not the listen ones
 	addrs="IPv4 $ip${SERVER_IP6:+, IPv6 $SERVER_IP6}"
 	la=$(listen_addrs)
 	a=$(src_addrs)
 	if [[ -n $a ]]; then addrs+="; $(msg "исходящие" "outgoing"): ${a// /, }"; fi
 	if [[ -n $la ]]; then
-		# clients: the listen addresses of the rules, plus the main address if some rule has none
+		# clients: the listen addresses, plus the main one if some rule has none
 		local -a shown=()
 		if [[ " ${RULES[*]} " == *" * "* ]]; then shown=("$ip"); fi
 		for a in $la; do
@@ -1613,27 +1617,27 @@ final_report() {
 		ip=$(printf '%s, ' "${shown[@]}")
 		ip=${ip%, }
 	fi
-	printf '\n'
-	printf '%s%s%s\n' "$C_BOLD$C_GRN" "$(msg "Готово. Прокладка слушает:" "Done. The relay listens on:")" "$C_OFF"
+	printf '\n%s%s%s\n' "$C_BOLD$C_GRN" "$(msg "Готово. Прокладка слушает:" "Done. The relay listens on:")" "$C_OFF"
 	group_info
 	for ((i = 0; i < ${#RULES[@]}; i++)); do
-		printf '  %s\n' "$(rule_line "$i")"
+		printf '    %s\n' "$(rule_line "$i")"
 	done
 	printf '\n'
+	hdr "Что дальше" "Next steps"
+	li "Клиентам - адрес этого сервера ${C_CYAN}$ip${C_OFF} вместо адреса сервера назначения; порты - те, что слушает прокладка." \
+		"Clients: use this server's address ${C_CYAN}$ip${C_OFF} instead of the destination's; the ports are the ones the relay listens on."
+	li "Если сервер назначения пускает не всех, разрешите на нём адреса прокладки: ${C_CYAN}$addrs${C_OFF}." \
+		"If the destination does not accept everyone, allow the relay addresses there: ${C_CYAN}$addrs${C_OFF}."
 	if has_sni; then
-		say "Имена должны указывать в DNS на адрес прокладки." "The names must point to the relay address in DNS."
+		li "Имена сайтов должны указывать в DNS на адрес прокладки." "The site names must point to the relay address in DNS."
 	fi
-	say "Клиентам: указать адрес этого сервера (${C_CYAN}$ip${C_OFF}) вместо адреса сервера назначения (порты - те, что слушает прокладка)." \
-		"Clients: use this server's address (${C_CYAN}$ip${C_OFF}) instead of the destination server's address (ports are the ones the relay listens on)."
-	say "Если сервер назначения пускает только с определённых адресов - разрешите на нём адреса прокладки: ${C_CYAN}$addrs${C_OFF}." \
-		"If the destination server accepts connections only from certain addresses, allow the relay addresses there: ${C_CYAN}$addrs${C_OFF}."
 	if [[ $PROXY_PROTOCOL == y ]]; then
 		warn "PROXY protocol включён: сервер назначения должен его принимать (TCP-правила)." \
 			"PROXY protocol is on: the destination must accept it (TCP rules)."
 	fi
 	if (($(count_port_rules) > 0)); then
-		say "Входящие на сервере фильтруются: порты открыты (iptables/nftables), служба nginx-stream-ports держит их открытыми после перезагрузки и перезапуска фаервола." \
-			"Incoming traffic on this server is filtered: the ports are open (iptables/nftables), the nginx-stream-ports service keeps them open after a reboot and a firewall restart."
+		li "Порты открыты в фаерволе сервера и останутся открытыми после перезагрузки (служба nginx-stream-ports)." \
+			"The ports are open in the server firewall and stay open after a reboot (nginx-stream-ports service)."
 	elif ! ufw_active && ! firewalld_active && input_drops_seen; then
 		warn "Во входящих фильтрах есть DROP/REJECT, а места для правил служба портов не нашла: проверьте, что порты $(rule_ports) открыты, и при нужде откройте их сами." \
 			"The input filters have DROP/REJECT rules, but the ports service found no place for its rules: check that the ports $(rule_ports) are open and open them yourself if needed."
@@ -1643,7 +1647,9 @@ final_report() {
 			"nginx is shared: worker limits (worker_rlimit_nofile, worker_connections) were not changed - consider raising them."
 	fi
 	cmd=$(self_cmd)
-	say "Настройки: $SETTINGS_FILE. Перенастроить или удалить: ${C_CYAN}$cmd${C_OFF}" "Settings: $SETTINGS_FILE. Reconfigure or uninstall: ${C_CYAN}$cmd${C_OFF}"
+	printf '\n'
+	say "Состояние, перенастройка, удаление: ${C_CYAN}$cmd${C_OFF}  ${C_DIM}(настройки: $SETTINGS_FILE)${C_OFF}" \
+		"Status, reconfigure, uninstall: ${C_CYAN}$cmd${C_OFF}  ${C_DIM}(settings: $SETTINGS_FILE)${C_OFF}"
 }
 
 # ---------------------------------------------------------------- system helpers (real mode only)
@@ -1657,10 +1663,8 @@ require_root() {
 	fi
 }
 
-# port_owners PROTO PORT [LISTEN_IP(* = all)] [exact] -> lines "nginx ADDR" / "other ADDR" for the sockets listening there
-# (ADDR: local address from ss, lower case, zone cut, "*" for 0.0.0.0, [::] and *).
-# Without "exact" a socket gets in if it is on the same address or on any address (it would clash with a bind);
-# with "exact" only the sockets on that very address.
+# port_owners PROTO PORT [LISTEN_IP(* = all)] [exact] -> lines "nginx ADDR" / "other ADDR"
+# ADDR: ss address, lower case, zone cut, "*" = any; without "exact" a socket on any address counts (clash)
 port_owners() {
 	local flag=t lip=${3:-*}
 	if [[ $1 == udp ]]; then flag=u; fi
@@ -1681,7 +1685,7 @@ port_owners() {
 	' || true
 }
 
-# previous rules of this installer (from settings.env): "proto:addr:port" -> 1; their nginx sockets are not a hindrance
+# previous rules from settings.env, "proto:addr:port" -> 1: their nginx sockets are no hindrance
 declare -A PREV_LISTEN=()
 load_prev_listen() {
 	local item p a
@@ -1698,8 +1702,8 @@ load_prev_listen() {
 	done
 }
 
-# port_busy PROTO PORT LISTEN_IP: 0 if a foreign socket (or an nginx socket that is not ours) is in the way.
-# BUSY_BY = other|nginx. Own mode: the whole nginx is ours; shared: only what the previous rules listened on.
+# port_busy PROTO PORT LISTEN_IP: 0 if a foreign (or not our) nginx socket is in the way; BUSY_BY=other|nginx
+# Own mode: all of nginx is ours; shared: only what the previous rules listened on.
 port_busy() {
 	local kind addr n=0 o=0
 	BUSY_BY=""
@@ -1726,7 +1730,7 @@ port_listening() { # PROTO PORT [LISTEN_IP]
 	fi
 }
 
-# 0 if the address is on this server
+# -> 0 if local
 has_local_addr() {
 	local a
 	a=$(strip_brackets "$1")
@@ -1764,7 +1768,7 @@ preflight_system() {
 	fi
 }
 
-# Own mode: nothing else lives in nginx; shared: nginx already serves sites.
+# own: nginx is ours alone; shared: it already serves sites
 pkg_conf_md5() { # PATH -> md5 of a package conffile (dpkg), empty if unknown
 	local p
 	for p in nginx-common nginx nginx-core; do
@@ -1775,10 +1779,10 @@ pkg_conf_md5() { # PATH -> md5 of a package conffile (dpkg), empty if unknown
 
 file_md5() { md5sum <"$1" 2>/dev/null | cut -d' ' -f1 || true; }
 
-# 0 only if nothing but the stock package config is there: then nginx.conf may be replaced
+# 0 only for the stock package config: nginx.conf may then be replaced
 nginx_pristine() {
 	local want f
-	# the stock site "default" serves /var/www/html: anything but the package page there is the owner's content
+	# anything but the package page in /var/www/html is the owner's content
 	if [[ -n $(find /var/www/html -mindepth 1 ! -path /var/www/html/index.nginx-debian.html -print -quit 2>/dev/null) ]]; then
 		return 1
 	fi
@@ -1799,13 +1803,13 @@ nginx_pristine() {
 	return 0
 }
 
-# Own mode (nginx.conf is replaced) only when that is certainly safe; otherwise shared (an include is added).
-# Runs before the packages are installed: it must know whether nginx was there.
+# Own mode (nginx.conf replaced) only when certainly safe, else shared (an include is added).
+# Runs before apt: it must know whether nginx was there.
 detect_mode() {
 	NGINX_WAS=0
 	if [[ -f $NGX_MAIN ]]; then NGINX_WAS=1; fi
-	# NGINX_FRESH: nginx was put there by the installer (kept on reconfigure): uninstall then switches it off.
-	# The mark file is left right after apt, so a first run that failed later still counts.
+	# NGINX_FRESH: the installer put nginx there (kept on reconfigure): uninstall then switches it off.
+	# The mark file is written right after apt, so a first run that failed later still counts.
 	if ((!NGINX_WAS)) || [[ -e $NGX_FRESH_MARK ]]; then
 		NGINX_FRESH=y
 	else
@@ -1816,7 +1820,7 @@ detect_mode() {
 	elif [[ $(head -n1 "$NGX_MAIN" 2>/dev/null || true) == "# nginx-stream - "* ]]; then
 		NGINX_MODE=${D[NGINX_MODE]:-own} NGINX_WHY=ours
 	elif [[ ${D[NGINX_MODE]:-} == own ]]; then
-		# own mode was chosen, but nginx.conf is not ours any more: it must not be replaced
+		# own mode chosen, but nginx.conf is no longer ours: do not replace it
 		NGINX_MODE=shared NGINX_WHY=changed
 	elif [[ -n ${D[NGINX_MODE]:-} ]]; then
 		NGINX_MODE=${D[NGINX_MODE]} NGINX_WHY=settings
@@ -1897,12 +1901,12 @@ apt_busy() {
 
 wait_apt() {
 	local i
-	# a fresh cloud VM: cloud-init may still be installing packages and holds the apt locks
+	# fresh cloud VM: cloud-init may hold the apt locks
 	if command -v cloud-init >/dev/null 2>&1 && [[ $(cloud-init status 2>/dev/null || true) == *"status: running"* ]]; then
 		step "cloud-init ещё настраивает систему, жду его завершения (до 10 минут)..." "cloud-init is still setting the system up, waiting for it (up to 10 minutes)..."
 		timeout 600 cloud-init status --wait >/dev/null 2>&1 || true
 	fi
-	# on a fresh VM the first unattended-upgrade run often takes several minutes
+	# the first unattended-upgrade run on a fresh VM can take minutes
 	for ((i = 0; i < 600; i += 5)); do
 		if ! apt_busy; then return 0; fi
 		if ((i == 0)); then
@@ -1917,7 +1921,7 @@ wait_apt() {
 
 pkg_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == "install ok installed" ]]; }
 
-# security updates on (what dpkg-reconfigure unattended-upgrades writes), without taking the dpkg lock
+# security updates on, as dpkg-reconfigure unattended-upgrades does, without the dpkg lock
 enable_auto_updates() {
 	local f=/etc/apt/apt.conf.d/20auto-upgrades
 	local want=$'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'
@@ -1929,7 +1933,7 @@ install_packages() {
 	local p v=""
 	# a stock nginx (or one built by hand) is not replaced by the package
 	if ! command -v nginx >/dev/null 2>&1 && ! pkg_installed nginx; then pkgs+=(nginx); fi
-	# the stream module: needed unless nginx is already there with stream built in (nginx.org: --with-stream)
+	# stream module: needed unless nginx has it built in (nginx.org: --with-stream)
 	if command -v nginx >/dev/null 2>&1; then v=$(nginx -V 2>&1 || true); fi
 	if [[ -z $v || $v == *--with-stream=dynamic* || ! $v =~ --with-stream([[:space:]]|$) ]]; then
 		pkgs+=(libnginx-mod-stream)
@@ -1940,16 +1944,16 @@ install_packages() {
 		if ! pkg_installed "$p"; then missing+=("$p"); fi
 	done
 	if ((${#missing[@]} == 0)); then
-		# reconfiguration: everything is there, apt is not needed (and may be busy with updates)
+		# reconfigure: everything is there; apt is not needed (and may be busy)
 		if [[ $AUTO_UPDATES == y ]]; then enable_auto_updates; fi
 		return 0
 	fi
 	wait_apt
 	export DEBIAN_FRONTEND=noninteractive
 	step "Ставлю пакеты: ${missing[*]}" "Installing packages: ${missing[*]}"
-	# a broken third-party repository must not stop the install: only the install itself has to work
+	# a broken third-party repository must not stop the install
 	apt-get update || warn "apt-get update завершился с ошибкой, продолжаю." "apt-get update failed, continuing."
-	# a fresh nginx must not start with the stock site: port 80 may be taken (apache) and postinst would fail;
+	# no stock site on a fresh nginx: port 80 may be taken (apache) and postinst would fail;
 	# nginx is started later with our config
 	if ((!NGINX_WAS)) && [[ ! -e $POLICY_RC ]]; then
 		printf '#!/bin/sh\nexit 101\n' >"$POLICY_RC"
@@ -1994,12 +1998,12 @@ detect_bbr() {
 	if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then printf y; else printf n; fi
 }
 
-# not "ufw status | grep -q": under pipefail grep quits early and ufw dies of SIGPIPE on a long output
+# not "ufw status | grep -q": under pipefail grep exits early and ufw dies of SIGPIPE
 ufw_active() { command -v ufw >/dev/null 2>&1 && [[ $(ufw status 2>/dev/null) == *"Status: active"* ]]; }
 
 firewalld_active() { systemctl is-active --quiet firewalld 2>/dev/null; }
 
-# put_file SRC DST MODE: copy with a backup next to the old file; unchanged files are skipped
+# put_file SRC DST MODE (backup beside the old file; unchanged files are skipped)
 put_file() {
 	local src=$1 dst=$2 mode=$3
 	mkdir -p "$(dirname "$dst")"
@@ -2017,7 +2021,7 @@ put_file() {
 	fi
 }
 
-# nginx.conf is overwritten in place: a symlink, owner and mode stay as they were
+# in place: a symlink, owner and mode stay as they were
 put_in_place() { cat "$1" >"$2"; }
 
 rollback_files() {
@@ -2034,7 +2038,7 @@ rollback_files() {
 	BAKS=() NEWS=()
 }
 
-# Put the system back as it was before this run (files, default site, units) and start the old nginx.
+# Restore the pre-run state (files, default site, units) and start the old nginx.
 rollback_apply() {
 	APPLIED=0
 	if ((PORTS_TOUCHED)); then systemctl disable --now nginx-stream-ports.service >/dev/null 2>&1 || true; fi
@@ -2060,7 +2064,7 @@ rollback_apply() {
 	warn "Установка не удалась: прежние файлы возвращены." "The install failed: previous files restored."
 }
 
-# apply_failed RU EN: roll back, show why nginx did not start, exit with an error
+# apply_failed RU EN: roll back, show why nginx failed, exit with an error
 apply_failed() {
 	local j
 	j=$(journalctl -u nginx -n 20 --no-pager 2>&1 || true)
@@ -2115,15 +2119,14 @@ remove_tuning() {
 	rm -f "$SYSCTL_FILE" "$MODLOAD_FILE"
 }
 
-# TCP ports below 10000 that listen right now (their RST must stay when scan protection is on)
+# TCP ports < 10000 listening now: their RST must stay under scan protection
 listening_tcp_ports() {
 	ss -Hlnt 2>/dev/null | awk '{ n = split($4, a, ":"); p = a[n]; if (p ~ /^[0-9]+$/ && p < 10000) print p }' |
 		sort -un | paste -sd' ' - || true
 }
 
-# TCP ports >= 10000 that listen right now: the ephemeral range 10000-65535 must not take them. Not UDP: ss lists
-# every unconnected UDP socket, client ones on ephemeral ports too. In own mode the sockets of nginx are skipped:
-# they are the previous rules, which may be dropped by this run.
+# TCP ports >= 10000 listening now: the ephemeral range must not take them. Not UDP: ss lists every
+# unconnected UDP socket, client ones too. Own mode skips nginx sockets: they are the previous rules.
 listening_high_ports() {
 	local skip=0
 	if [[ $NGINX_MODE == own ]]; then skip=1; fi
@@ -2133,12 +2136,12 @@ listening_high_ports() {
 		sort -un | paste -sd' ' - || true
 }
 
-# UFW_RULES = the rules this installer adds (or added before): a rule that exists already is not ours
+# UFW_RULES: rules this installer adds or added before; a rule that already exists is not ours
 plan_ufw() {
 	local r added prev=" ${D[UFW_RULES]:-} "
 	UFW_RULES=""
 	if ! ufw_active; then
-		# ufw is off for now: the rules added earlier stay on record (they come back into force with ufw)
+		# ufw is off: earlier rules stay on record (they apply again with ufw)
 		if command -v ufw >/dev/null 2>&1; then UFW_RULES=${D[UFW_RULES]:-}; fi
 		return 0
 	fi
@@ -2161,8 +2164,8 @@ sync_ufw() {
 	done
 }
 
-# PORT_TOKENS = "proto:port:fam" of the relay listens (fam 4, 6 or 46), without duplicates. Whether the ports must be
-# opened is decided by ports.sh at every start, not here: a firewall switched on later is picked up too.
+# PORT_TOKENS = "proto:port:fam" of the relay listens (fam 4, 6 or 46), unique. ports.sh decides at
+# every start whether to open them, not here: a firewall switched on later is picked up.
 plan_ports() {
 	local rule proto lip lp host tp src sni f t
 	local -A seen=()
@@ -2183,8 +2186,8 @@ plan_ports() {
 	done
 }
 
-# Our rules are put back by our own unit: the rules of the other tools (netfilter-persistent) are a snapshot of
-# the whole ruleset, with docker's dynamic chains in it.
+# Our rules are restored by our own unit: other tools (netfilter-persistent) save a snapshot of the
+# whole ruleset, with docker's dynamic chains in it.
 remove_ports_service() {
 	if [[ -e $PORTS_UNIT || -e $PORTS_SCRIPT ]]; then
 		systemctl disable --now nginx-stream-ports.service >/dev/null 2>&1 || true
@@ -2202,7 +2205,7 @@ count_port_rules() {
 			n=$((n + $("$bin" -w 5 -S INPUT 2>/dev/null | grep -cE -e "$IPT_MARK_RE" || true)))
 		fi
 	done
-	# iptables-nft rules show up in nft as well (chain INPUT of ip/ip6 filter): counted above already
+	# iptables-nft rules also show in nft (ip/ip6 filter INPUT): already counted above
 	if command -v nft >/dev/null 2>&1; then
 		n=$((n + $(nft list ruleset 2>/dev/null | awk -v m="$NFT_MARK_RE" '
 			$1 == "table" { fam = $2 }
@@ -2213,8 +2216,8 @@ count_port_rules() {
 	printf '%s' "$n"
 }
 
-# Some DROP/REJECT in the input filters of iptables or of a foreign nft table (our table is not counted): with no
-# rule of ours added, the relay ports may be closed by a rule the ports service does not take for a final one.
+# Some DROP/REJECT in iptables or a foreign nft input filter (not our table) and none of our rules added:
+# the relay ports may be closed by a rule the ports service does not take for a final one.
 input_drops_seen() {
 	local bin s=""
 	for bin in iptables ip6tables; do
@@ -2230,7 +2233,7 @@ input_drops_seen() {
 		END { exit !f }'
 }
 
-# Lines with our comment out of the rules the owner saved himself (iptables-persistent): they would come back at boot
+# Lines with our comment in the owner's saved rules (iptables-persistent) would come back at boot
 strip_saved_ipt() {
 	local f tmp
 	for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
@@ -2248,7 +2251,6 @@ strip_saved_ipt() {
 	fi
 }
 
-# 0 if every listen port is served by nginx
 verify_listening() {
 	local rule proto lip lp host tp src sni bad=0 i
 	local -A seen=()
@@ -2261,9 +2263,9 @@ verify_listening() {
 			sleep 1
 		done
 		if port_listening "$proto" "$lp" "$lip"; then
-			ok "  $(fmt_lp "$lip" "$lp")/$proto: слушает" "  $(fmt_lp "$lip" "$lp")/$proto: listening"
+			ok "  $(fmt_lp "$lip" "$lp")/$proto  ok" "  $(fmt_lp "$lip" "$lp")/$proto  ok"
 		else
-			bad "  $(fmt_lp "$lip" "$lp")/$proto: nginx НЕ слушает" "  $(fmt_lp "$lip" "$lp")/$proto: nginx is NOT listening"
+			bad "  $(fmt_lp "$lip" "$lp")/$proto  nginx не слушает" "  $(fmt_lp "$lip" "$lp")/$proto  nginx is not listening"
 			bad=1
 		fi
 	done
@@ -2281,13 +2283,13 @@ fetch_self() {
 	fi
 }
 
-# How to call the installer again: the kept copy, or the one-liner when no copy could be made.
+# How to rerun the installer: the kept copy, else the one-liner.
 self_cmd() {
 	if ((SELF_KEPT)); then printf 'nginx-stream'; else printf 'bash <(wget -qO- --inet4-only %s)' "$SELF_URL"; fi
 }
 
-# Keep a copy as $SELF_PATH. With `bash <(wget ...)` $0 is /dev/fd/N (cannot be read again) and with
-# `curl | bash` it is just "bash" (a stray file of that name may exist), so then the file is downloaded.
+# Keep a copy as $SELF_PATH. Under `bash <(wget ...)` $0 is /dev/fd/N (unreadable twice), under
+# `curl | bash` it is just "bash" (a stray file of that name may exist): then download.
 install_self() {
 	local src="" tmp="$STAGE/self.sh"
 	SELF_KEPT=0
@@ -2315,7 +2317,7 @@ apply() {
 	SSH_PORT=$(detect_ssh_port)
 	BBR=n
 	if [[ $TUNE == y ]]; then BBR=$(detect_bbr); fi
-	# shared mode leaves the sites alone, a link the owner put back after switching to his nginx.conf too
+	# shared mode leaves sites alone, also a link the owner put back with their own nginx.conf
 	DEFAULT_SITE_REMOVED=n
 	if [[ $NGINX_MODE == own && -L $NGX_DIR/sites-enabled/default ]]; then DEFAULT_SITE_REMOVED=y; fi
 	if [[ $NGINX_MODE == own && ${D[DEFAULT_SITE_REMOVED]:-} == y ]]; then DEFAULT_SITE_REMOVED=y; fi
@@ -2324,6 +2326,7 @@ apply() {
 	if [[ $SCAN_PROTECT == y ]]; then OPEN_TCP=$(listening_tcp_ports); fi
 	if [[ $TUNE == y ]]; then OPEN_HIGH=$(listening_high_ports); fi
 
+	step "Записываю настройки и запускаю nginx..." "Writing the settings and starting nginx..."
 	render_all "$STAGE"
 	if need_firewall && ! nft -c -f "$STAGE/firewall.nft" 2>"$STAGE/nft.err"; then
 		warn "nft не принял правила защиты, защита отключена: $(tr '\n' ' ' <"$STAGE/nft.err")" \
@@ -2356,10 +2359,11 @@ apply() {
 	systemctl restart nginx-stream-ports.service ||
 		warn "Не удалось открыть порты в фаерволе: $(journalctl -u nginx-stream-ports -n 5 --no-pager 2>&1 | tr '\n' ' ')" \
 			"Could not open the ports in the firewall: $(journalctl -u nginx-stream-ports -n 5 --no-pager 2>&1 | tr '\n' ' ')"
+	step "Проверяю порты:" "Checking the ports:"
 	verify_listening ||
 		apply_failed "Не все порты открыты, прежние файлы возвращены." "Not all ports are open, previous files restored."
-	# verified: settings are saved last, then nothing is rolled back; what is switched off is removed only after
-	# that (a signal in between would roll back files the rollback cannot bring back)
+	# verified: settings are saved last, then nothing is rolled back; what is switched off is removed only
+	# after that (a signal in between would roll back files the rollback cannot bring back)
 	put_file "$STAGE/settings.env" "$SETTINGS_FILE" 600
 	APPLIED=0
 	drop_backups
@@ -2395,7 +2399,7 @@ status() {
 			n="$n, $(ss -Htn state established "( sport = :$lp )" 2>/dev/null | wc -l) conn"
 		fi
 		if [[ -n ${GNAMED[$gk]:-} ]]; then
-			# a group with names: the state once, the destinations below
+			# named group: state once, destinations below
 			printf '  %s %s  [%s]\n' "$proto" "$(fmt_lp "$lip" "$lp")" "$n"
 			for ((j = 0; j < ${#RULES[@]}; j++)); do
 				if [[ ${RULES[j]} == "$proto $lip $lp "* ]]; then printf '    %s\n' "$(rule_line "$j" sub)"; fi
@@ -2406,7 +2410,7 @@ status() {
 	done
 	say "UDP-сокетов nginx: $(ss -Hlnup 2>/dev/null | grep -c '"nginx"' || true)" "nginx UDP sockets: $(ss -Hlnup 2>/dev/null | grep -c '"nginx"' || true)"
 	if need_firewall; then
-		# the unit is oneshot and stays active after "flush ruleset": ask nft for the table itself
+		# the oneshot unit stays active after "flush ruleset": ask nft for the table itself
 		# shellcheck disable=SC2086  # NFT_TABLE is "family name": two words on purpose
 		if nft list table $NFT_TABLE >/dev/null 2>&1; then
 			say "Таблица защит nft: ${C_GRN}есть${C_OFF}" "Protection nft table: ${C_GRN}present${C_OFF}"
@@ -2427,7 +2431,7 @@ uninstall() {
 	local -a pkgs=()
 	require_root
 	load_settings_globals
-	# the only question goes first, before anything is changed; end of input means "no"
+	# the only question, asked before any change; end of input means "no"
 	if [[ $NGINX_MODE == shared ]]; then
 		# purge would take /etc/nginx with the other sites
 		say "nginx обслуживает и другие сайты - пакет оставлен." "nginx serves other sites too - the package is kept."
@@ -2493,10 +2497,13 @@ uninstall() {
 
 show_menu() {
 	local c
-	hdr "nginx-stream уже установлен." "nginx-stream is already installed."
-	say "  ${C_CYAN}1)${C_OFF} Перенастроить  ${C_CYAN}2)${C_OFF} Статус  ${C_CYAN}3)${C_OFF} Удалить  ${C_CYAN}4)${C_OFF} Выход" \
-		"  ${C_CYAN}1)${C_OFF} Reconfigure  ${C_CYAN}2)${C_OFF} Status  ${C_CYAN}3)${C_OFF} Uninstall  ${C_CYAN}4)${C_OFF} Quit"
-	read -r -e -p "> " -i 1 c || die "Ввод прерван" "Input aborted"
+	printf '\n'
+	hdr "Прокладка уже установлена. Что сделать?" "The relay is already installed. What to do?"
+	opt 1 "$(msg "Перенастроить" "Reconfigure")"
+	opt 2 "$(msg "Состояние" "Status")"
+	opt 3 "$(msg "Удалить" "Uninstall")"
+	opt 4 "$(msg "Выход" "Quit")"
+	read -r -e -p "$RL_CYAN>$RL_OFF " -i 1 c || die "Ввод прерван" "Input aborted"
 	case $c in
 	1) return 0 ;;
 	2)
@@ -2524,7 +2531,7 @@ run_dry() {
 	v_ram "$RAM_MB" || bad_value --ram-mb
 	NGINX_FRESH=y
 	plan_ports
-	# only the files render_all writes are replaced: the directory may hold anything else
+	# replace only render_all's files: the directory may hold anything else
 	for f in nginx.conf nginx-stream.conf nginx-service-override.conf 90-nginx-stream.conf modules-load-nginx-stream.conf \
 		firewall.nft nginx-stream-firewall.service ports.sh nginx-stream-ports.service nftables-service-nginx-stream.conf settings.env; do
 		rm -f "${OUT_DIR:?}/$f"
@@ -2584,6 +2591,7 @@ main() {
 	*) ;;
 	esac
 	setup_tty
+	if ((!YES)); then banner; fi
 	if ((PREV_INSTALLED && !YES)); then
 		local keep=$UI_LANG
 		if [[ -z $UI_LANG ]]; then UI_LANG=${D[UI_LANG]:-ru}; fi

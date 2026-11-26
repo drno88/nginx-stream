@@ -68,14 +68,14 @@ parameters").
 
 **Language** — Russian or English. Russian by default.
 
-**Destination address (IPv4, IPv6 or domain)** — where to send connections. This is the server that really serves
+**Destination address** — where to send connections. This is the server that really serves
 the clients. Required. If you give a domain, nginx looks up its IP once, at start; if the domain's IP changes,
 restart nginx: `systemctl restart nginx`.
 
 **Port rules** — what to accept and where to send it. The default is `tcp:443`: accept TCP on port 443 and send
 it to the same port of the destination server. How to write your own is in "Port rules" below.
 
-**Listen on** — on which relay addresses to accept connections: IPv4 only, or IPv4 and IPv6. By default both, if
+**Listen on which addresses?** — on which relay addresses to accept connections: IPv4 only, or IPv4 and IPv6. By default both, if
 the server has IPv6. If you do not know, leave it as it is.
 
 **Send PROXY protocol to the destination?** — whether to pass the real client address to the destination server.
@@ -85,7 +85,7 @@ destination server is set up to accept it, otherwise no connection will get thro
 **nginx log** — `none` (default) or `errors only`. Errors help when something does not work; the log is in
 `/var/log/nginx/error.log`.
 
-**Tune kernel parameters (sysctl, BBR)?** — set up the network for a proxy: more simultaneous connections,
+**Tune kernel parameters?** — set up the network for a proxy: more simultaneous connections,
 buffers, the BBR algorithm. The default is **yes**. Settings that cannot be changed on this server are simply
 skipped.
 

@@ -1,7 +1,6 @@
 [Unit]
 Description=nginx-stream: relay ports open in the host firewall
-# own unit, not a saved ruleset snapshot; it follows the other firewall: restart, reload, stop + start
-# (start of nftables: its drop-in)
+# follows the other firewall: restart, reload, stop + start (start of nftables: its drop-in)
 After=network-pre.target nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service firewalld.service
 PartOf=nftables.service netfilter-persistent.service
 ReloadPropagatedFrom=nftables.service netfilter-persistent.service

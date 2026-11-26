@@ -1,8 +1,7 @@
 """Test stand helper: run commands and upload files on a clean VM over SSH.
 
-Access is read from SERVER_ACCESS.local.md (not in git): blocks `## name` with lines `host: ...`, `user: ...`,
-`password: ...`; STAND=name picks a block (default: the first one).
-The host key is pinned in .work/known_hosts on first connect; a changed key stops the run.
+Access: SERVER_ACCESS.local.md (not in git), blocks `## name` with `host:`, `user:`, `password:` lines;
+STAND=name picks a block (default: the first). The host key is pinned in .work/known_hosts; a changed key stops.
 
   python tools/stand.py run 'uname -a'          run a command
   python tools/stand.py sh < script.sh          run a script with bash -s

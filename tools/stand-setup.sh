@@ -1,6 +1,5 @@
 #!/bin/bash
-# Test stand backends: TCP and UDP echo servers on this VM's global IPv6 (ports 9443/tcp, 9444/udp),
-# as persistent units, so a relay rule like tcp:443>[v6]:9443 can be checked end to end and across a reboot.
+# Stand backends: persistent TCP/UDP echo servers on the VM's global IPv6 (9443/tcp, 9444/udp).
 #   python tools/stand.py sh < tools/stand-setup.sh
 set -euo pipefail
 V6=$(ip -6 -o addr show scope global | awk '{split($4, a, "/"); print a[1]; exit}')

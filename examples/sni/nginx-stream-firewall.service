@@ -1,6 +1,6 @@
 [Unit]
 Description=nginx-stream firewall (own nftables table)
-# nftables.service runs flush ruleset: after its restart or reload our table is loaded again (start: its drop-in)
+# nftables.service flushes the ruleset: our table is loaded again after its restart/reload (start: drop-in)
 After=network-pre.target nftables.service
 PartOf=nftables.service
 ReloadPropagatedFrom=nftables.service

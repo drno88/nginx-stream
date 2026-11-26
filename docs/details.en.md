@@ -31,7 +31,7 @@ proto:[listen_ip:]listen[/name][>[host:]port][@src]
 - `proto` — `tcp`, `udp` or `both` (the same as two rules: tcp and udp).
 - `listen_ip` — the relay address to listen on, IPv4 or IPv6 in square brackets. The address must be on the
   server (`ip addr`); write IPv6 the way `ip addr` shows it. Without it the rule listens on all addresses (the
-  "Listen on" question).
+  "Listen on which addresses?" question).
 - `listen` — the port on the relay, 1–65535; leading zeros are dropped.
 - `/name` — `tcp` only: the name from the TLS ClientHello (SNI). An exact name or `*.zone` (all subdomains, the
   zone itself is not included); case does not matter, punycode is allowed, up to 253 characters. Rules with the
