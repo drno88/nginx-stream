@@ -25,13 +25,14 @@
 
 ```bash
 # nginx-stream: OpenVPN принимает и IPv6 (переустановка AntiZapret возвращает udp4/tcp4)
-cd /etc/openvpn/server &&
+(
+	cd /etc/openvpn/server || exit
 	if grep -qsE '^proto (udp|tcp)4$' antizapret-udp.conf vpn-udp.conf antizapret-tcp.conf vpn-tcp.conf; then
-		sed -i -E 's/^proto (udp|tcp)4$/proto \16/' antizapret-udp.conf vpn-udp.conf antizapret-tcp.conf vpn-tcp.conf
+		sed -i -E 's/^proto (udp|tcp)4$/proto \16/' antizapret-udp.conf vpn-udp.conf antizapret-tcp.conf vpn-tcp.conf 2>/dev/null
 		systemctl --no-block try-restart openvpn-server@antizapret-udp openvpn-server@vpn-udp \
 			openvpn-server@antizapret-tcp openvpn-server@vpn-tcp 2>/dev/null
 	fi
-cd /root/antizapret
+)
 # nginx-stream: адрес прокладки - в исключения защиты от атак
 ipset add antizapret-allow6 2001:db8::5 -exist 2>/dev/null || true
 ```
