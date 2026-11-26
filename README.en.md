@@ -274,6 +274,55 @@ bash install.sh --dry-run --yes --target 2001:db8::10 --out ./out
 
 Ready-made results for different cases are in [examples/](examples/).
 
+## A relay to AntiZapret-VPN
+
+A common case: an [AntiZapret-VPN](https://github.com/GubernievS/AntiZapret-VPN) server is closed to clients over
+IPv4 but reachable over IPv6. The relay accepts clients over IPv4 and takes them to the server over IPv6. Three steps.
+
+**1. On the AntiZapret server — let OpenVPN accept IPv6.** AntiZapret sets OpenVPN up for IPv4 only
+(`proto udp4`, `proto tcp4`), so it will not accept connections from the relay over IPv6. Change the `proto`
+line and restart the running OpenVPN servers:
+
+```bash
+cd /etc/openvpn/server
+sed -i 's/^proto udp4$/proto udp6/' antizapret-udp.conf vpn-udp.conf
+sed -i 's/^proto tcp4$/proto tcp6/' antizapret-tcp.conf vpn-tcp.conf
+systemctl try-restart openvpn-server@antizapret-udp openvpn-server@vpn-udp \
+  openvpn-server@antizapret-tcp openvpn-server@vpn-tcp
+```
+
+`udp6` and `tcp6` accept both IPv6 and IPv4, so clients that connect directly keep working. WireGuard and
+AmneziaWG accept IPv6 without changes. **Repeat this after reinstalling or updating AntiZapret** — it puts
+`udp4` back. Tested on UDP; TCP is set up the same way.
+
+**2. On the relay — install with the AntiZapret ports.** AntiZapret maps its backup ports (80, 443, 504, 508,
+540, 580, 52080, 52443) to the real ones for IPv4 only, so for IPv6 the relay does it:
+
+```bash
+bash install.sh --target 2001:db8::10 --ports 'both:80>50080,both:443>50443,both:504>50443,both:508>50080,both:50080,both:50443,udp:540>51443,udp:580>51080,udp:52080>51080,udp:52443>51443,udp:51080,udp:51443'
+```
+
+Put the AntiZapret server's IPv6 address instead of `2001:db8::10` (`ip -6 addr show scope global` on it).
+The installer asks the rest.
+
+| Ports on the relay | Port on the AntiZapret server | What |
+|---|---|---|
+| 80, 508, 50080 | 50080 | OpenVPN |
+| 443, 504, 50443 | 50443 | OpenVPN |
+| 580, 52080, 51080 | 51080 | WireGuard / AmneziaWG |
+| 540, 52443, 51443 | 51443 | WireGuard / AmneziaWG |
+
+If you do not need OpenVPN over TCP, replace `both:` with `udp:`. The relay can take port 80 only if no site
+uses it; otherwise drop the `both:80>50080` rule.
+
+**3. Clients — the relay address.** In the profiles replace the AntiZapret server address with the relay address:
+the `remote` line in OpenVPN, `Endpoint` in WireGuard and AmneziaWG. The ports stay the same.
+
+If attack protection is on in AntiZapret: all clients reach it from the one relay address. Its limit is 100,000
+new connections an hour per address, which is usually enough. AntiZapret has no exceptions file for IPv6; under
+heavy load the relay address can be excluded with `ipset add antizapret-allow6 <relay IPv6>` (until AntiZapret
+restarts).
+
 ## Common problems
 
 **Clients cannot connect.** Check in order:
