@@ -14,6 +14,8 @@ everything up.
 Clients connect to the relay, and the relay connects to the destination server. To the client it looks as if the
 relay itself were the server.
 
+> **A guide just for AntiZapret-VPN (in Russian) is [here](antizapret/README.md).**
+
 ## When you need it
 
 - **The server is reachable over IPv6 only**, but clients use IPv4. The relay accepts on IPv4 and passes on over
@@ -273,10 +275,6 @@ bash install.sh --dry-run --yes --target 2001:db8::10 --out ./out
 ```
 
 Ready-made results for different cases are in [examples/](examples/).
-
-## Recipes
-
-- [A relay to AntiZapret-VPN](antizapret/README.md) (in Russian): the server is closed over IPv4, clients go through the relay over IPv6.
 
 ## Common problems
 
