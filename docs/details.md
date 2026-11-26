@@ -53,6 +53,7 @@ proto:[listen_ip:]listen[/name][>[host:]port][@src]
 | `/etc/systemd/system/nginx.service.d/nginx-stream.conf` | `LimitNOFILE=262144`, `Restart=on-failure`, `RestartSec=2s` |
 | `/etc/sysctl.d/90-nginx-stream.conf` | параметры ядра (при тюнинге); значения зависят от объёма памяти |
 | `/etc/modules-load.d/nginx-stream.conf` | загрузка `tcp_bbr` (если BBR доступен) |
+| `/etc/default/grub.d/99-nginx-stream-nr-cpus.cfg` | `nr_cpus=N` в строке загрузки ядра (при тюнинге и только если хостер объявляет лишние ядра); действует после перезагрузки |
 | `/etc/nginx-stream/firewall.nft` и служба `nginx-stream-firewall.service` | защита SSH и/или от сканирования, в своей таблице `inet nginx_stream` |
 | `/etc/nginx-stream/ports.sh` и служба `nginx-stream-ports.service` | открытие портов прокладки в фаерволе сервера (см. «Фаервол»): скрипт `up`/`down` со списком портов и юнит, который запускает его при загрузке и вместе с чужим фаерволом |
 | `/etc/systemd/system/nftables.service.d/nginx-stream.conf` | после каждого старта `nftables.service` (его `flush ruleset` стирает наши правила) перезапускает службы защит и портов |
@@ -128,6 +129,7 @@ stream, как в сборке nginx.org): `nginx`, `libnginx-mod-stream`, пр�
 - останавливает и удаляет службу защит и таблицу `inet nginx_stream`, службу портов `nginx-stream-ports` и
   drop-in для `nftables.service`;
 - удаляет файлы sysctl и modules-load; **значения ядра остаются до перезагрузки**;
+- удаляет файл `nr_cpus` из `/etc/default/grub.d` и запускает `update-grub`; предел ядер снимется после перезагрузки;
 - удаляет override systemd и `/etc/nginx/nginx-stream.conf`;
 - в режиме «свой» возвращает прежний `nginx.conf` и сайт `default`; в режиме «общий» убирает строку include;
 - удаляет правила ufw, iptables и nftables, которые добавил установщик (правила, бывшие до него, не трогает);
@@ -184,6 +186,12 @@ stream, как в сборке nginx.org): `nginx`, `libnginx-mod-stream`, пр�
   Сеть — /24 для IPv4 и /64 для IPv6, счётчики живут 2 минуты.
 - `proxy_bind`, а не SNAT. SNAT требует conntrack и правил в таблице nat и пересекается с ufw и docker;
   `proxy_bind` делает сам nginx, по правилу, и ничего не добавляет в ядро.
+- `nr_cpus`. Некоторые хостеры объявляют до 240 возможных ядер на машине с одним, и ядро держит память под каждое
+  (`Percpu:` в `/proc/meminfo`; на сервере с 1 ГБ — больше 100 МБ). Срабатывает, когда возможных ядер хотя бы вчетверо
+  больше настоящих и освободится не меньше 16 МБ; N — число настоящих ядер, но не меньше 2. Файл пишется после
+  проверки установки (откат загрузчик не возвращает), применяется `update-grub` и действует после перезагрузки.
+  Пропускается в контейнере, без GRUB и если `nr_cpus`/`possible_cpus` уже задан. Предел мешает переезду на тариф
+  с большим числом ядер — см. «Частые проблемы» в README.
 - BBR включается, только если модуль `tcp_bbr` загружается и `bbr` есть в доступных алгоритмах.
 - Вывод цветной, только если идёт в терминал; цвет отключают `NO_COLOR` (любое непустое значение) и `TERM=dumb`.
 

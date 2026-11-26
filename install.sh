@@ -12,7 +12,7 @@ fi
 
 # ---------------------------------------------------------------- constants
 
-readonly INSTALLER_VER="1.0.0"
+readonly INSTALLER_VER="1.1.0"
 readonly T=$'\t'
 readonly NGX_DIR=/etc/nginx
 readonly NGX_MAIN=$NGX_DIR/nginx.conf
@@ -34,6 +34,7 @@ readonly NFTABLES_CONF=/etc/nftables.conf
 readonly NGX_OVERRIDE=/etc/systemd/system/nginx.service.d/nginx-stream.conf
 readonly SYSCTL_FILE=/etc/sysctl.d/90-nginx-stream.conf
 readonly MODLOAD_FILE=/etc/modules-load.d/nginx-stream.conf
+readonly NRCPU_FILE=/etc/default/grub.d/99-nginx-stream-nr-cpus.cfg
 readonly SELF_PATH=/usr/local/sbin/nginx-stream
 readonly SELF_URL=https://raw.githubusercontent.com/drno88/nginx-stream/main/install.sh
 readonly NFT_TABLE="inet nginx_stream"
@@ -60,6 +61,7 @@ NGINX_WAS=0 NGINX_WHY="" # NGINX_WAS: nginx.conf existed before; NGINX_WHY: why 
 OPEN_TCP=""              # TCP ports < 10000 listening at install time: kept out of the RST drop
 OPEN_HIGH=""             # TCP ports >= 10000 listening at install time: kept out of the ephemeral range
 R_PROTO="" R_LIP="" R_LP="" R_HOST="" R_TP="" R_SRC="" R_SNI=""
+NRCPU_N="" NRCPU_FREE_MB="" REBOOT="" REBOOT_NEEDED=0 # nr_cpus: target and estimate (empty: not needed); --reboot value
 SSH_PORT="22" BBR=n HAVE_IPV6=n SERVER_IP4="" SERVER_IP6="" PREV_INSTALLED=0 DOMAIN_WARNED=0
 
 # ---------------------------------------------------------------- output
@@ -200,7 +202,8 @@ nginx-stream: прокладка (relay) на nginx stream. Установщик
   --logs off|error      журнал nginx (off)
   --tcp-timeout ВРЕМЯ   простой TCP до закрытия, формат nginx (10m)
   --udp-timeout ВРЕМЯ   простой UDP-сессии (10m)
-  --tune y|n            параметры ядра (y)
+  --tune y|n            параметры ядра и предел числа возможных ядер процессора (y)
+  --reboot y|n          перезагрузить, если параметры ядра этого требуют (с --yes по умолчанию n)
   --ssh-protect y|n     ограничить частые новые подключения к SSH (y)
   --scan-protect y|n    не отвечать на ping и закрытые порты (n)
   --auto-updates y|n    автообновления безопасности (y)
@@ -249,7 +252,8 @@ What to install (asked interactively unless given as a flag):
   --logs off|error      nginx log (off)
   --tcp-timeout TIME    idle TCP timeout, nginx format (10m)
   --udp-timeout TIME    idle UDP session timeout (10m)
-  --tune y|n            kernel parameters (y)
+  --tune y|n            kernel parameters and a limit on possible CPUs (y)
+  --reboot y|n          reboot if the kernel settings need it (default n with --yes)
   --ssh-protect y|n     rate-limit new SSH connections (y)
   --scan-protect y|n    do not answer ping and closed ports (n)
   --auto-updates y|n    unattended security updates (y)
@@ -282,7 +286,7 @@ parse_args() {
 		--yes | -y) YES=1 ;;
 		--dry-run) DRY_RUN=1 ;;
 		--lang | --target | \
-			--ports | --listen | --proxy-protocol | --logs | --tcp-timeout | --udp-timeout | --tune | \
+			--ports | --listen | --proxy-protocol | --logs | --tcp-timeout | --udp-timeout | --tune | --reboot | \
 			--ssh-protect | --scan-protect | --auto-updates | --ram-mb | --out)
 			(($#)) || die "Флагу $arg нужно значение" "Flag $arg needs a value"
 			case $arg in
@@ -836,8 +840,8 @@ ask_all() {
 		"off|нет|none" \
 		"error|только ошибки|errors only"
 	ask_yn TUNE "Настроить параметры ядра?" "Tune kernel parameters?" \
-		"Больше соединений, сетевые буферы, BBR. Что ядро не даёт поменять, пропускается." \
-		"More connections, network buffers, BBR. What the kernel does not allow is skipped."
+		"Больше соединений, сетевые буферы, BBR, предел лишних ядер. Что ядро не даёт поменять, пропускается." \
+		"More connections, network buffers, BBR, a cap on extra CPUs. What the kernel does not allow is skipped."
 	ask_yn SSH_PROTECT "Защитить SSH от перебора?" "Protect SSH from brute force?" \
 		"Не больше 10 новых подключений в минуту с одной сети (/24, IPv6: /64): подбор пароля бесполезен." \
 		"At most 10 new connections a minute from one network (/24, IPv6: /64): password guessing is pointless."
@@ -1215,6 +1219,13 @@ render_modules_load() {
 	emit "tcp_bbr"
 }
 
+# render_nrcpu N (grub sources this file, so the variable must stay literal)
+render_nrcpu() {
+	emit "# nginx-stream: limit possible CPUs (per-CPU kernel memory)"
+	# shellcheck disable=SC2016  # literal on purpose
+	emit 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nr_cpus='"$1"'"'
+}
+
 # render_sysctl RAM_MB BBR(y|n)
 render_sysctl() {
 	local ram=$1 bbr=$2 rdef=1048576 bufs="4096 262144 16777216" high low press reserved
@@ -1588,6 +1599,10 @@ show_choices() {
 	row "PROXY protocol         " "PROXY protocol         " "$(yn_word "$PROXY_PROTOCOL")"
 	row "Журнал nginx           " "nginx log              " "$(msg "$logs_ru" "$logs_en")"
 	row "Параметры ядра         " "Kernel tuning          " "$(yn_word "$TUNE")"
+	if [[ -n $NRCPU_N ]]; then
+		row "Лишние ядра            " "Extra CPUs             " \
+			"$(msg "ограничить до $NRCPU_N (освободит ~$NRCPU_FREE_MB МБ после перезагрузки)" "limit to $NRCPU_N (frees ~$NRCPU_FREE_MB MB after a reboot)")"
+	fi
 	row "Защита SSH             " "SSH protection         " "$(yn_word "$SSH_PROTECT")"
 	row "Защита от сканирования " "Scan protection        " "$(yn_word "$SCAN_PROTECT")"
 	row "Автообновления         " "Security updates       " "$(yn_word "$AUTO_UPDATES")"
@@ -1998,6 +2013,43 @@ detect_bbr() {
 	if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then printf y; else printf n; fi
 }
 
+# cpu_count LIST: "0-239" or "0,2-5" -> number of CPUs
+cpu_count() {
+	local part n=0 a b
+	local IFS=,
+	for part in $1; do
+		a=${part%-*}
+		b=${part#*-}
+		if [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]]; then n=$((n + b - a + 1)); fi
+	done
+	printf '%s' "$n"
+}
+
+# Some hosters announce far more possible CPUs than exist: the kernel keeps per-CPU memory for each.
+# Sets NRCPU_N and NRCPU_FREE_MB when nr_cpus on the boot line would help (empty otherwise).
+cpu_waste() {
+	local possible present kb n
+	NRCPU_N="" NRCPU_FREE_MB=""
+	# our own file already there: nothing to change
+	if [[ -e $NRCPU_FILE ]]; then return 0; fi
+	command -v update-grub >/dev/null 2>&1 || return 0
+	[[ -f /etc/default/grub && -f /boot/grub/grub.cfg ]] || return 0
+	if systemd-detect-virt --container --quiet 2>/dev/null; then return 0; fi
+	# the owner's own limit
+	if grep -Eq '(^| )(nr_cpus|possible_cpus)=' /proc/cmdline 2>/dev/null; then return 0; fi
+	possible=$(cpu_count "$(cat /sys/devices/system/cpu/possible 2>/dev/null || true)")
+	present=$(cpu_count "$(cat /sys/devices/system/cpu/present 2>/dev/null || true)")
+	if ((present < 1 || possible < 4 * present)); then return 0; fi
+	n=$present
+	if ((n < 2)); then n=2; fi
+	kb=$(awk '/^Percpu:/{print $2}' /proc/meminfo 2>/dev/null || true)
+	kb=$((${kb:-0} * (possible - n) / possible / 1024))
+	# a reboot for a few MB is not worth it
+	if ((kb < 16)); then return 0; fi
+	NRCPU_FREE_MB=$kb
+	NRCPU_N=$n
+}
+
 # not "ufw status | grep -q": under pipefail grep exits early and ufw dies of SIGPIPE
 ufw_active() { command -v ufw >/dev/null 2>&1 && [[ $(ufw status 2>/dev/null) == *"Status: active"* ]]; }
 
@@ -2117,6 +2169,42 @@ remove_firewall() {
 
 remove_tuning() {
 	rm -f "$SYSCTL_FILE" "$MODLOAD_FILE"
+	if [[ -e $NRCPU_FILE ]]; then
+		rm -f "$NRCPU_FILE"
+		update-grub >/dev/null 2>&1 || true
+	fi
+}
+
+# nr_cpus goes in after the install is verified: a bad boot line is not something the rollback can undo
+apply_nrcpu() {
+	if [[ -z $NRCPU_N ]]; then return 0; fi
+	mkdir -p "$(dirname "$NRCPU_FILE")"
+	render_nrcpu "$NRCPU_N" >"$NRCPU_FILE"
+	chmod 644 "$NRCPU_FILE"
+	if update-grub >/dev/null 2>&1; then
+		REBOOT_NEEDED=1
+		return 0
+	fi
+	rm -f "$NRCPU_FILE"
+	update-grub >/dev/null 2>&1 || true
+	warn "update-grub не прошёл, предел ядер не записан." "update-grub failed, the CPU limit was not set."
+	NRCPU_N=""
+}
+
+maybe_reboot() {
+	local go=0
+	if ((!REBOOT_NEEDED)); then return 0; fi
+	if [[ -n $REBOOT ]]; then
+		if [[ $REBOOT == y ]]; then go=1; fi
+	elif ((!YES)) && confirm "Перезагрузить сейчас, чтобы освободить память?" "Reboot now to free the memory?" y; then
+		go=1
+	fi
+	if ((go)); then
+		step "Перезагружаю сервер..." "Rebooting..."
+		systemctl --no-block reboot
+	else
+		dim "Перезагрузите сервер позже: лишние ядра освободятся после неё." "Reboot the server later: the extra CPUs are freed after it."
+	fi
 }
 
 # TCP ports < 10000 listening now: their RST must stay under scan protection
@@ -2369,6 +2457,7 @@ apply() {
 	drop_backups
 	if ! need_firewall; then remove_firewall; fi
 	if [[ $TUNE != y ]]; then remove_tuning; fi
+	apply_nrcpu
 	if ufw_active; then
 		sync_ufw
 	elif firewalld_active; then
@@ -2422,6 +2511,14 @@ status() {
 	local svc
 	svc=$(stc "$(systemctl is-active nginx-stream-ports.service 2>&1 || true)")
 	say "Служба портов: $svc, правил открыто: $n" "Ports service: $svc, rules open: $n"
+	if [[ -e $NRCPU_FILE ]]; then
+		n=$(grep -o 'nr_cpus=[0-9]*' "$NRCPU_FILE" | head -n1 || true)
+		if grep -Eq "(^| )$n( |\$)" /proc/cmdline 2>/dev/null; then
+			say "Лишние ядра: $n в загрузчике" "Extra CPUs: $n in the bootloader"
+		else
+			say "Лишние ядра: $n в загрузчике (ждёт перезагрузки)" "Extra CPUs: $n in the bootloader (waiting for a reboot)"
+		fi
+	fi
 	hdr "Настройки ($SETTINGS_FILE):" "Settings ($SETTINGS_FILE):"
 	grep -v '^#' "$SETTINGS_FILE" | sed 's/^/  /'
 }
@@ -2442,8 +2539,11 @@ uninstall() {
 	remove_firewall
 	remove_ports_service
 	strip_saved_ipt
-	if [[ -e $SYSCTL_FILE ]]; then
+	if [[ -e $SYSCTL_FILE || -e $NRCPU_FILE ]]; then
 		say "Значения ядра останутся до перезагрузки." "Kernel values stay until reboot."
+	fi
+	if [[ -e $NRCPU_FILE ]]; then
+		say "Предел числа ядер (nr_cpus) снимется после перезагрузки." "The CPU limit (nr_cpus) is lifted after a reboot."
 	fi
 	remove_tuning
 	rm -f "$NGX_OVERRIDE"
@@ -2543,17 +2643,23 @@ run_dry() {
 
 run_install() {
 	require_root
+	if [[ -n $REBOOT ]]; then
+		REBOOT=$(norm_yn "$REBOOT")
+		v_yn "$REBOOT" || bad_value --reboot
+	fi
 	detect_mode
 	ask_lang
 	preflight_system
 	ask_all
 	build_rules
 	preflight_rules
+	if [[ $TUNE == y ]]; then cpu_waste; fi
 	show_choices
 	confirm "Продолжить?" "Continue?" y || die "Остановлено." "Stopped."
 	install_packages
 	apply
 	final_report
+	maybe_reboot
 }
 
 main() {

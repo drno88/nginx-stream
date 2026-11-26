@@ -90,6 +90,8 @@ destination server is set up to accept it, otherwise no connection will get thro
 **Tune kernel parameters?** — set up the network for a proxy: more simultaneous connections,
 buffers, the BBR algorithm. The default is **yes**. Settings that cannot be changed on this server are simply
 skipped.
+If the hoster announces many more possible CPUs than the server really has, the installer limits them
+(`nr_cpus`) and offers a reboot — this frees memory (up to 100+ MB on 1 GB servers).
 
 **Protect SSH from brute force?** — at most 10 new SSH connections per minute from one network (/24, for IPv6 — /64);
 the extras are dropped. Guessing a password becomes pointless. The default is **yes**. It does not get in the way of normal SSH
@@ -231,6 +233,7 @@ bash install.sh --yes --target 2001:db8::10 --ports 'tcp:443,udp:443'
 | `--tcp-timeout` | after how long to close a TCP connection with no traffic | `90s` (seconds), `10m` (minutes), `1h` (hours), `1d` (days) | `10m` |
 | `--udp-timeout` | the same for UDP | the same | `10m` |
 | `--tune` | kernel parameters | `y` / `n` | `y` |
+| `--reboot` | reboot if the kernel settings need it; with `--yes` and no flag it does not reboot | `y` / `n` | `n` with `--yes`, otherwise asks |
 | `--ssh-protect` | SSH brute-force protection | `y` / `n` | `y` |
 | `--scan-protect` | scan protection | `y` / `n` | `n` |
 | `--auto-updates` | unattended security updates | `y` / `n` | `y` |
@@ -292,6 +295,10 @@ Ready-made results for different cases are in [examples/](examples/).
 hosting panel or take another server.
 
 **The IP of the destination domain changed.** nginx looks up the domain's IP only at start: `systemctl restart nginx`.
+
+**You moved to a plan with more CPUs, but fewer are used.** The installer may have set a CPU cap (`nr_cpus`).
+Delete `/etc/default/grub.d/99-nginx-stream-nr-cpus.cfg`, run `update-grub`, reboot the server, then run
+`nginx-stream` and choose "Reconfigure".
 
 **You turned on ufw after the installation.** Run `nginx-stream`, choose "Reconfigure" and keep the same answers —
 the ports will be opened in ufw too.

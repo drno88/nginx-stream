@@ -55,6 +55,7 @@ proto:[listen_ip:]listen[/name][>[host:]port][@src]
 | `/etc/systemd/system/nginx.service.d/nginx-stream.conf` | `LimitNOFILE=262144`, `Restart=on-failure`, `RestartSec=2s` |
 | `/etc/sysctl.d/90-nginx-stream.conf` | kernel parameters (when tuning); values depend on memory size |
 | `/etc/modules-load.d/nginx-stream.conf` | loads `tcp_bbr` (if BBR is available) |
+| `/etc/default/grub.d/99-nginx-stream-nr-cpus.cfg` | `nr_cpus=N` on the kernel boot line (when tuning, and only if the hoster announces extra CPUs); takes effect after a reboot |
 | `/etc/nginx-stream/firewall.nft` and the `nginx-stream-firewall.service` unit | SSH and/or scan protection, in its own `inet nginx_stream` table |
 | `/etc/nginx-stream/ports.sh` and the `nginx-stream-ports.service` unit | opens the relay ports in the server firewall (see "Firewall"): an `up`/`down` script with the port list and a unit that runs it at boot and together with the other firewall |
 | `/etc/systemd/system/nftables.service.d/nginx-stream.conf` | after every start of `nftables.service` (its `flush ruleset` wipes our rules) restarts the protection and ports services |
@@ -131,6 +132,7 @@ with them. An interruption during the install (Ctrl+C, a dropped SSH connection)
 - stops and removes the protection service and the `inet nginx_stream` table, the `nginx-stream-ports` service and
   the drop-in for `nftables.service`;
 - removes the sysctl and modules-load files; **kernel values stay until reboot**;
+- removes the `nr_cpus` file from `/etc/default/grub.d` and runs `update-grub`; the CPU limit is lifted after a reboot;
 - removes the systemd override and `/etc/nginx/nginx-stream.conf`;
 - in own mode restores the previous `nginx.conf` and the `default` site; in shared mode removes the include line;
 - removes the ufw, iptables and nftables rules the installer added (rules that existed before are left alone); the
@@ -188,6 +190,12 @@ Briefly, why it is done this way.
   /24 for IPv4 and /64 for IPv6, the counters live for 2 minutes.
 - `proxy_bind`, not SNAT. SNAT needs conntrack and rules in the nat table and clashes with ufw and docker;
   `proxy_bind` is done by nginx itself, per rule, and adds nothing to the kernel.
+- `nr_cpus`. Some hosters announce up to 240 possible CPUs on a one-CPU machine, and the kernel keeps memory for
+  each (`Percpu:` in `/proc/meminfo`; over 100 MB on a 1 GB server). It fires when the possible CPUs are at least
+  four times the real ones and at least 16 MB would be freed; N is the real count but not less than 2. The file is
+  written after the install is verified (the rollback does not restore the bootloader), applied with `update-grub`
+  and effective after a reboot. Skipped in a container, without GRUB and when `nr_cpus`/`possible_cpus` is already
+  set. The cap gets in the way of moving to a plan with more CPUs — see "Common problems" in the README.
 - BBR is enabled only if the `tcp_bbr` module loads and `bbr` is among the available algorithms.
 - The output is in color only when it goes to a terminal; `NO_COLOR` (any non-empty value) and `TERM=dumb` turn
   the color off.
