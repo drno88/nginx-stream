@@ -1,0 +1,16 @@
+[Unit]
+Description=nginx-stream firewall (own nftables table)
+# nftables.service runs flush ruleset: after its restart or reload our table is loaded again (start: its drop-in)
+After=network-pre.target nftables.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nginx-stream/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/nginx-stream/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet nginx_stream
+
+[Install]
+WantedBy=multi-user.target
